@@ -1,0 +1,229 @@
+# Must-fail controls, for check_controls.sh. Each entry is a header line "== <module> <line>:<col>" followed by
+# the exact message of the one error that `lake build <module>` must report, at that position of the module's file.
+== C72T1Controls.C01InverseConvention 15:2
+Tactic `decide` proved that the proposition
+  (permute c3) (Pi.single 0 1) = Pi.single ((Equiv.symm c3) 0) 1
+is false
+== C72T1Controls.C02ProductOrder 16:2
+Tactic `decide` proved that the proposition
+  (permute (c3 * Equiv.swap 0 1)) (Pi.single 0 1) = (permute (Equiv.swap 0 1)) ((permute c3) (Pi.single 0 1))
+is false
+== C72T1Controls.C03EvenNotTypeII 18:2
+Tactic `decide` proved that the proposition
+  ∀ (a : ZMod 2), 4 ∣ wt (a • ![1, 1])
+is false
+== C72T1Controls.C04DecompositionAtTwo 14:34
+Tactic `decide` proved that the proposition
+  2 ≠ 2
+is false
+== C72T1Controls.C05CoreWithoutPrimes 19:4
+Tactic `decide` proved that the proposition
+  7 = 2 ∨ 7 = 3 ∨ 7 = 5
+is false
+== C72T1Controls.C06CoreWithoutOrder5 19:6
+Tactic `decide` proved that the proposition
+  5 ≠ 5
+is false
+== C72T1Controls.C07CoreWithoutOrder3 19:6
+Tactic `decide` proved that the proposition
+  3 ≠ 3
+is false
+== C72T1Controls.C08CoreWithoutOrder2 19:6
+Tactic `decide` proved that the proposition
+  2 ≠ 2
+is false
+== C72T1Controls.C09ContractedWithoutSelfDual 16:86
+Tactic `decide` proved that the proposition
+  2 * 0 = 3
+is false
+== C72T2Controls.C01TraceBilinear 14:2
+Tactic `decide` proved that the proposition
+  ∀ (u v : F4), ∑ b, u.psi b * v.psi b = (u * v).tr
+is false
+== C72T2Controls.C02ActionConjugate 13:2
+Tactic `decide` proved that the proposition
+  ∀ (u : F4) (b : Fin 3), (wb * u).psi b = u.psi (b - 1)
+is false
+== C72T2Controls.C03Lemma41Coefficient 25:2
+Tactic `decide` proved that the proposition
+  ∀ (x : ZMod 2) (u : F4), cw x u + 2 * ind (x ≠ 0 ∧ u ≠ 0) = 3 * ind (x ≠ 0) + 2 * ind (u ≠ 0)
+is false
+== C72T2Controls.C04GolayMinWeight12 24:2
+Tactic `decide` proved that the proposition
+  chk12 12 g24mask false 0 = true
+is false
+== C72T2Controls.C05ShiftDirection 17:2
+Tactic `decide` proved that the proposition
+  w • Pi.single 0 1 = Pi.single 0 wb
+is false
+== C72T2Controls.C06GolayGram 20:2
+Tactic `decide` proved that the proposition
+  ∀ (i j : Fin 12), toVec (badMask i) ⬝ᵥ toVec (badMask j) = 0
+is false
+== C72T3Controls.C01FrobeniusTrace 14:2
+Tactic `decide` proved that the proposition
+  ∀ (y y' : F16), psi y ⬝ᵥ psi y' = tr (y * y' ^ 2)
+is false
+== C72T3Controls.C02TPrimitive 13:2
+Tactic `decide` proved that the proposition
+  F16.t ^ 5 ≠ 1
+is false
+== C72T3Controls.C03ShiftDirection 16:2
+Tactic `decide` proved that the proposition
+  ∀ (y : F16) (b : Fin 5), psi (F16.t * y) b = psi y ((finRotate 5) b)
+is false
+== C72T3Controls.C04Lemma23At12 12:2
+Tactic `decide` proved that the proposition
+  L23.chk 12 0 = true
+is false
+== C72T3Controls.C05IdentityAt16 15:2
+Tactic `decide` proved that the proposition
+  16 ≤ M (Pi.single 0 1) + M (Pi.single 0 1 ᵥ* 1)
+is false
+== C72T3Controls.C06FixedPointsSameHalf 17:2
+Tactic `decide` proved that the proposition
+  ∃ Sx ∈ e8Words,
+    ∃ Sx' ∈ e8Words,
+      wt (cat (wordVec Sx) (wordVec Sx')) = 4 ∧
+        cat (wordVec Sx) (wordVec Sx') 7 = 1 ∧ cat (wordVec Sx) (wordVec Sx') 15 = 1
+is false
+== C72T3Controls.C07WrongFanoLine 16:2
+Tactic `decide` proved that the proposition
+  ∀ (j : Fin 4), wordVec ({0, 1, 2}, 1) ⬝ᵥ Tests.e8gen j = 0
+is false
+== C72T3Controls.C08AllOnesRow 15:2
+Tactic `decide` proved that the proposition
+  16 ≤ (M fun x ↦ 1) + wpsi 1
+is false
+== C72T4Controls.T4C01AStdConvention 15:2
+Tactic `decide` proved that the proposition
+  (permute aStd) (pv ![1, 0] ![0, 1]) = pv ![1, 0] ![0, 1]
+is false
+== C72T4Controls.T4C02WeightWithoutFactorTwo 15:2
+Tactic `decide` proved that the proposition
+  wt (pv ![1, 0, 0] (![1, 0, 0] + ![0, 1, 1])) = wt ![0, 1, 1] + 1
+is false
+== C72T4Controls.T4C03BadSetBoundary 14:2
+Tactic `decide` proved that the proposition
+  8 + 2 * 4 < 16
+is false
+== C72T4Controls.T4C04CorruptRowOrtho 15:2
+Tactic `decide` proved that the proposition
+  (orthoCheckOn fun r ↦ if r = 0 then mask 0 0 ^^^ 1 else mask 0 r) = true
+is false
+== C72T4Controls.T4C05CorruptRowPivot 15:2
+Tactic `decide` proved that the proposition
+  (pivotCheckOn fun r ↦ if r = 1 then mask 0 0 else mask 0 r) = true
+is false
+== C72T4Controls.T4C06ModelNeedsSelfDual 16:2
+Tactic `decide` proved that the proposition
+  a4 ⬝ᵥ b4 = 0
+is false
+== C72T5Controls.C01IdentityLabelling 16:2
+Tactic `decide` proved that the proposition
+  go tetsStd octsStd 6 8 0 0 0 = true
+is false
+== C72T5Controls.C02MinWeight8 14:2
+Tactic `decide` proved that the proposition
+  go tets octs 8 8 0 0 0 = true
+is false
+== C72T5Controls.C03BilinearProduct 14:2
+Tactic `decide` proved that the proposition
+  ∀ (r s : Fin 8), ∑ j, erow r j * erow s j = 0
+is false
+== C72T5Controls.C04HD48Threshold16 16:2
+Tactic `decide` proved that the proposition
+  go 16 12 0 0 0 = true
+is false
+== C72T6Controls.T6C01DisjointNeeded 14:2
+Tactic `decide` proved that the proposition
+  ((DT Y4 {0}) u1) u1 = 0
+is false
+== C72T6Controls.T6C02PivotNeeded 14:2
+Tactic `decide` proved that the proposition
+  ∃ t, ψ2 (![1, 0] + t • d2) = 0
+is false
+== C72T6Controls.T6C03StrictDecreaseNeeded 14:2
+Tactic `decide` proved that the proposition
+  ∃ B, True ∧ ∀ (n : Bool), B = n → ¬True
+is false
+== C72T6Controls.T6C04LeadingBitsNeeded 12:2
+Tactic `decide` proved that the proposition
+  4 % 2 ^ 2 < 1 % 2 ^ 2 → 4 < 1
+is false
+== C72T6Controls.T6C05DiagNeeded 14:2
+Tactic `decide` proved that the proposition
+  4 ∣ wt (pv 0 ↑u1)
+is false
+== C72T6Controls.T6C06SymmetryNeeded 15:2
+Tactic `decide` proved that the proposition
+  pv z1 (z1 + ↑u1) ⬝ᵥ pv 0 (0 + ↑u2) = 0
+is false
+== C72T6KControls.T6C07PairFormNeedsCommute 15:2
+Tactic `decide` proved that the proposition
+  (bK (0, 1)).1 = (bK (0, 0)).1
+is false
+== C72T6KControls.T6C08LiftNeedsInvariance 15:2
+Tactic `decide` proved that the proposition
+  ((formAct βT Bn) u1) u2 = (Bn u1) u2
+is false
+== C72T6KControls.T6C09TransversalNeedsSelfDual 15:2
+Tactic `decide` proved that the proposition
+  ((formAct βF (DT ⊤ {0})) y10) y10 = ((DT ⊤ {0}) y10) y10
+is false
+== C72T6KControls.T6C10FpfNeedsAb 14:2
+Tactic `decide` proved that the proposition
+  (aStd (0, 0)).1 ≠ 0
+is false
+== C72T6O3Controls.C01ClosureWithoutQ1 16:2
+(kernel) application type mismatch
+  id (Eq.refl true)
+argument has type
+  true = true
+but function has type
+  decide (closeIter 2 159 = FULL) = true → decide (closeIter 2 159 = FULL) = true
+== C72T6O3Controls.C02SwapNotAut 14:2
+Tactic `decide` proved that the proposition
+  autOK (Equiv.swap 0 1) = true
+is false
+== C72T6O3Controls.C03RhoViolatesN2 14:2
+Tactic `decide` proved that the proposition
+  rho 7 < rho 12
+is false
+== C72T6O3Controls.C04KqMovesQ1 13:2
+Tactic `decide` proved that the proposition
+  (kq 6) q1 = q1
+is false
+== C72T6O5Controls.C01KeyNotPattern 15:2
+(kernel) application type mismatch
+  id (Eq.refl true)
+argument has type
+  true = true
+but function has type
+  decide (key revRow = pattern revRow) = true → decide (key revRow = pattern revRow) = true
+== C72T6O5Controls.C02ReflectionNotColl 14:2
+Tactic `decide` proved that the proposition
+  linesOK ![0, 6, 5, 4, 3, 2, 1] = true
+is false
+== C72T6O5Controls.C03FrobMovesClasses 13:2
+Tactic `decide` proved that the proposition
+  ∀ (y : F16), cls (y ^ 2) = cls y
+is false
+== C72T6O5Controls.C04ScanOrder 13:2
+Tactic `decide` proved that the proposition
+  scanIdx 2 0 < scanIdx 3 0
+is false
+== C72T6O5Controls.C05KeyUsesFrob 14:2
+(kernel) application type mismatch
+  id (Eq.refl true)
+argument has type
+  true = true
+but function has type
+  decide (key frobRow = 3) = true → decide (key frobRow = 3) = true
+== C72T6O5Controls.C06PropertyOne 14:2
+(kernel) application type mismatch
+  id (Eq.refl true)
+argument has type
+  true = true
+but function has type
+  decide (NFi diagM) = true → decide (NFi diagM) = true

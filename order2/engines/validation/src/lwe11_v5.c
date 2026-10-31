@@ -1,0 +1,969 @@
+// Level-wise exhaustive search for the C2 x C2 instances produced by lwprep.py.
+// Variables are grouped by Gram row (level).  At a node all variables of levels < t are assigned; the k_t
+// level-t variables v are enumerated as a bitset of 2^k_t children.  Every constraint of level t has syndrome
+// s = s0 + L v (s0 from the assigned variables); children with s in Bad are removed, either by enumerating all
+// children (Gray code) or by solving L v = b + s0 for each bad b and removing the coset v0 + ker L.
+// Usage: lwe INSTANCE [SPLITLEVEL NPART PART]
+// lwe11 (c2opt/alg stream) = lwe10 with a new level filter; same search tree and same pruning decisions:
+//  - s0 of all constraints of a level as one uint16 vector, kept incrementally along the path (4-bit chunk
+//    row tables per lower level, stamped by the node identity nid[e]);
+//  - bad children of a constraint = base bitmap of the coset of s0 modulo Im L, XOR-translated by v0 with
+//    VPERMB (bytes) + GF2P8AFFINEQB (bits within a byte): a few AVX-512 instructions per constraint;
+//  - lh_reject is skipped at levels where it cannot return 1 (no orbit word completed at level t-1, no trigger at t).
+//  Levels with kt > 16 use the lwe10 code.  LWE11CHECK=1 verifies every fast node against a direct computation.
+// lwe10 = lwe9 + branch-free inner loops (list filter, coset reduction, one-word translation); same decisions.
+// lwe9 = lwe8 with the same search and the same pruning decisions, made faster by caching:
+//  - base syndromes s0 of level-t constraints: part from levels < t-2 cached per grandparent node (epoch nid[t-2]),
+//    plus table lookups for the level t-2 and t-1 values (tables U2, U1);
+//  - list mode: child syndrome contributions L v from a per-constraint table V (kt <= 12);
+//  - LTSH: syndromes of key/orbit words cached per ancestor node (epoch nid[lv+1]); transported canonical values
+//    of orbit words cached likewise.  Debug/validation: identical LEVEL lines to lwe8 on the same input.
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <signal.h>
+#include <unistd.h>
+#include <immintrin.h>
+typedef uint64_t u64;
+typedef unsigned __int128 u128;
+static inline int par128(u128 x) { return (__builtin_popcountll((u64)x) + __builtin_popcountll((u64)(x >> 64))) & 1; }
+static void die(const char *m) { fprintf(stderr, "%s\n", m); exit(1); }
+
+typedef struct {
+    int lv, wt, m, nbad;
+    u128 fm[16]; int fc[16];          // syndrome forms (over all variables) and constants
+    u128 lowm[16];                     // masks restricted to variables below the level
+    u64 *badbm;                        // bitmap of bad syndromes (2^m bits)
+    int *bad;                          // list of bad syndromes
+    // level-t part
+    int kt; uint32_t col[32];          // column j: syndrome contribution of level variable j (m bits)
+    int method;                        // 0 = enumerate children, 1 = solve per bad syndrome
+    int rank; int pivc[16]; uint32_t T[16]; uint32_t Z[16]; int nz;   // RREF data: pivot columns, transforms, zero-row checks
+    int kdim; uint32_t kb[32];         // kernel basis
+    // translated-base-bitmap method (method 3): image basis of L (syndrome space), cosets of Im L
+    int tb;                            // 1 if method 3 available
+    int irank; int ipiv[16]; uint32_t ivec[16]; uint32_t ipre[16];   // reduced image basis: ivec (m-bit), pivot bit, preimage (kt-bit)
+    int ncos; int cbits[16];           // non-pivot syndrome coordinates (coset index bits)
+    u64 *base;                         // ncos bitmaps of 2^kt bits each
+    // lwe9 caches: s0 = A ^ U2[x_{t-2}] ^ U1[x_{t-1}];  A = fc ^ parities over levels < t-2 (epoch nid[t-2])
+    int usetab; u128 lowA[16]; uint16_t *U1, *U2; int Aval; unsigned long long Ast;
+    uint16_t *V;                       // V[v] = L v for kt <= 12 (list mode)
+} Con;
+
+static int N, NLEV, NC; static int vstart[40]; static Con *C; static int lstart[41]; static int *ORD;
+static u128 asg;
+static long long nodes[40], kids[40], nsol = 0;
+static int SPL = -1, NPART = 1, PART = 0; static long long splitcnt = 0;
+static u64 *alive[40]; static u64 *tmpbuf;
+static long PROBES = 0; static double est[41]; static unsigned long long rs = 0x9E3779B97F4A7C15ULL;
+static inline unsigned long long rnd64(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; }
+static double probe_w; static int probe_mode = 0;
+
+static volatile sig_atomic_t stopflag = 0;
+// ---- LTS symmetry (lex-leader on transported syndromes), see symprep.py ----
+static int SYM = 0, SM = 0, SC0 = -1, SNE = 0; static int *scanon = NULL; static int *sent_c = NULL; static uint32_t *sent_rows = NULL;
+static long long symprune[40];
+// ---- LTS-r: lex-leader on the key (s_w0, ..., s_w{r-1}) over all g in G (see symprep2.py) ----
+static int LR = 0, LRr = 0, LRnG = 0; static int LRc[16], LRm[16];
+static int *LRgc = NULL; static uint16_t *LRrows = NULL;
+static int *LRls = NULL, *LRlg = NULL, *LRlj = NULL;
+static long long ltsprune[41];
+// ---- hybrid LTS-r (LTSH, see symprep3.py) ----
+static int LH = 0, LHr, LHm0, LHc0, LHnO, LHnS0, LHnG, LHncls; static int LHc[16], LHm[16];
+static int *LHcanon, *LHh, *LHclsOf, *LHJs, *LHJ, *LHmul, *LHuc, *LHcomp, *LHgc;
+static uint16_t *LHut, *LHgt; static unsigned *LHtrig; static long long lhprune[41];
+static int *SCval = NULL; static unsigned *SCstamp = NULL; static unsigned SCcur = 0;
+static unsigned long long nid[42], NIDC = 0;                     // node identity per level (epoch)
+static int *EPval = NULL; static unsigned long long *EPst = NULL;  // syndromes cached by epoch nid[lv+1]
+static int *UAval = NULL, *UCval = NULL; static unsigned long long *UCst = NULL;   // per orbit word u: a, canon(a)
+static int syndrome_of(int c);
+static void onsig(int sg) { (void)sg; stopflag = 1; }
+static void read_sym(const char *fn) {
+    FILE *f = fopen(fn, "r"); if (!f) die("open sym");
+    if (fscanf(f, "%d %d %d", &SM, &SC0, &SNE) != 3) die("sym hdr");
+    scanon = malloc(sizeof(int) << SM);
+    for (int i = 0; i < (1 << SM); i++) if (fscanf(f, "%d", &scanon[i]) != 1) die("sym canon");
+    sent_c = malloc(sizeof(int) * (SNE + 1)); sent_rows = malloc(sizeof(uint32_t) * (SNE + 1) * SM);
+    for (int e = 0; e < SNE; e++) { if (fscanf(f, "%d", &sent_c[e]) != 1) die("sym ent");
+        for (int j = 0; j < SM; j++) { unsigned x; if (fscanf(f, "%u", &x) != 1) die("sym row"); sent_rows[e * SM + j] = x; } }
+    fclose(f); SYM = 1;
+}
+static void read_inst(const char *fn) {
+    FILE *f = fopen(fn, "r"); if (!f) die("open");
+    if (fscanf(f, "%d %d %d", &N, &NLEV, &NC) != 3) die("hdr");
+    if (N > 128 || NLEV > 38) die("size");
+    for (int t = 0; t <= NLEV; t++) if (fscanf(f, "%d", &vstart[t]) != 1) die("vstart");
+    C = calloc(NC, sizeof(Con));
+    for (int c = 0; c < NC; c++) {
+        Con *X = &C[c];
+        if (fscanf(f, "%d %d %d %d", &X->lv, &X->wt, &X->m, &X->nbad) != 4) die("con");
+        if (X->m > 16) die("m>16");
+        for (int s = 0; s < X->m; s++) {
+            char hx[64]; if (fscanf(f, "%63s %d", hx, &X->fc[s]) != 2) die("form");
+            u128 v = 0; for (char *q = hx; *q; q++) { int dv = (*q <= '9') ? *q - '0' : ((*q | 32) - 'a' + 10); v = (v << 4) | (u128)dv; }
+            X->fm[s] = v;
+        }
+        int nb = ((1 << X->m) + 63) / 64; X->badbm = calloc(nb, sizeof(u64)); X->bad = malloc(sizeof(int) * (X->nbad + 1));
+        for (int k = 0; k < X->nbad; k++) { int b; if (fscanf(f, "%d", &b) != 1) die("bad"); X->bad[k] = b; X->badbm[b >> 6] |= 1ULL << (b & 63); }
+    }
+    fclose(f);
+    // level starts (constraints sorted by level)
+    int c = 0;
+    for (int t = 0; t <= NLEV; t++) { while (c < NC && C[c].lv < t) c++; lstart[t] = c; }
+    lstart[NLEV] = NC;
+    for (int k = 0; k < NC - 1; k++) if (C[k].lv > C[k + 1].lv) die("constraints not sorted");
+    // precompute level parts
+    for (int k = 0; k < NC; k++) {
+        Con *X = &C[k]; int t = X->lv; int kt = vstart[t + 1] - vstart[t]; X->kt = kt;
+        if (kt > 30) die("kt>30");
+        u128 lowmask = (vstart[t] == 0) ? 0 : ((((u128)1) << vstart[t]) - 1);
+        for (int s = 0; s < X->m; s++) {
+            X->lowm[s] = X->fm[s] & lowmask;
+            u128 hi = X->fm[s] >> vstart[t];
+            if (vstart[t + 1] < 128 && (X->fm[s] >> vstart[t + 1]) != 0) die("form uses variables above its level");
+            for (int j = 0; j < kt; j++) if ((hi >> j) & 1) X->col[j] |= 1u << s;
+        }
+        // RREF of L (m rows x kt cols): rows as kt-bit vectors with transform (m-bit)
+        uint32_t R[16], Tr[16]; int m = X->m;
+        for (int s = 0; s < m; s++) { R[s] = 0; for (int j = 0; j < kt; j++) if ((X->col[j] >> s) & 1) R[s] |= 1u << j; Tr[s] = 1u << s; }
+        int r = 0; int pc[16];
+        for (int j = 0; j < kt && r < m; j++) {
+            int p = -1; for (int s = r; s < m; s++) if ((R[s] >> j) & 1) { p = s; break; }
+            if (p < 0) continue;
+            uint32_t tmp = R[p]; R[p] = R[r]; R[r] = tmp; tmp = Tr[p]; Tr[p] = Tr[r]; Tr[r] = tmp;
+            for (int s = 0; s < m; s++) if (s != r && ((R[s] >> j) & 1)) { R[s] ^= R[r]; Tr[s] ^= Tr[r]; }
+            pc[r] = j; r++;
+        }
+        X->rank = r; X->nz = 0;
+        for (int i = 0; i < r; i++) { X->pivc[i] = pc[i]; X->T[i] = Tr[i]; }
+        for (int s = r; s < m; s++) X->Z[X->nz++] = Tr[s];
+        // kernel basis: for each free column f: v = e_f + sum_{i} R[i]_f e_{pivc[i]}
+        X->kdim = 0; uint32_t pivmask = 0; for (int i = 0; i < r; i++) pivmask |= 1u << pc[i];
+        for (int fcol = 0; fcol < kt; fcol++) if (!((pivmask >> fcol) & 1)) {
+            uint32_t v = 1u << fcol;
+            for (int i = 0; i < r; i++) if ((R[i] >> fcol) & 1) v |= 1u << pc[i];
+            X->kb[X->kdim++] = v;
+        }
+        double costA = (double)(1ULL << kt), costB = (double)X->nbad * ((double)(1ULL << X->kdim) + 4.0);
+        X->method = (r == 0) ? 2 : (costB < costA ? 1 : 0);
+        X->tb = 0; X->base = NULL;
+        if (r > 0) {
+            // image basis: columns col[j] (m-bit) -> reduced basis with preimages
+            int ir = 0; uint32_t iv[16], ip[16]; int pv[16];
+            for (int j = 0; j < kt; j++) {
+                uint32_t v = X->col[j], pre = 1u << j;
+                for (int q = 0; q < ir; q++) if ((v >> pv[q]) & 1) { v ^= iv[q]; pre ^= ip[q]; }
+                if (!v) continue;
+                int pb = __builtin_ctz(v);
+                for (int q = 0; q < ir; q++) if ((iv[q] >> pb) & 1) { iv[q] ^= v; ip[q] ^= pre; }
+                iv[ir] = v; ip[ir] = pre; pv[ir] = pb; ir++;
+            }
+            X->irank = ir; for (int q = 0; q < ir; q++) { X->ivec[q] = iv[q]; X->ipre[q] = ip[q]; X->ipiv[q] = pv[q]; }
+            int nc = 0; uint32_t pmask = 0; for (int q = 0; q < ir; q++) pmask |= 1u << pv[q];
+            for (int b = 0; b < m; b++) if (!((pmask >> b) & 1)) X->cbits[nc++] = b;
+            long ncos = 1L << nc; long words = ((1L << kt) + 63) / 64;
+            if (ncos * words * 8 <= 65536) {
+                X->ncos = (int)ncos; X->base = calloc(ncos * words, sizeof(u64));
+                for (long ci2 = 0; ci2 < ncos; ci2++) {
+                    uint32_t crep = 0; for (int q = 0; q < nc; q++) if ((ci2 >> q) & 1) crep |= 1u << X->cbits[q];
+                    // base_c = { v : L v ^ crep in Bad }
+                    u64 *B = X->base + ci2 * words;
+                    int sv = (int)crep;
+                    for (long v = 0; v < (1L << kt); v++) {
+                        if (v) { int j = __builtin_ctzl(v); sv ^= X->col[j]; }
+                        long g = v ^ (v >> 1);
+                        if ((X->badbm[sv >> 6] >> (sv & 63)) & 1) B[g >> 6] |= 1ULL << (g & 63);
+                    }
+                }
+                X->tb = 1;
+            }
+        }
+    }
+}
+
+static inline int syn0_plain(const Con *X) {
+    int s0 = 0;
+    for (int s = 0; s < X->m; s++) s0 |= (par128(X->lowm[s] & asg) ^ X->fc[s]) << s;
+    return s0;
+}
+static inline int lvval(int l) { return (int)((asg >> vstart[l]) & ((((u128)1) << (vstart[l + 1] - vstart[l])) - 1)); }
+static inline int syn0(Con *X) {
+    if (!X->usetab) return syn0_plain(X);
+    int t = X->lv;
+    if (X->Ast != nid[t - 2]) {
+        int a = 0; for (int s = 0; s < X->m; s++) a |= (par128(X->lowA[s] & asg) ^ X->fc[s]) << s;
+        X->Aval = a; X->Ast = nid[t - 2];
+    }
+    return X->Aval ^ X->U2[lvval(t - 2)] ^ X->U1[lvval(t - 1)];
+}
+static void build_tables(void) {
+    long bytes = 0;
+    for (int c = 0; c < NC; c++) {
+        Con *X = &C[c]; int t = X->lv; X->usetab = 0; X->U1 = X->U2 = NULL; X->V = NULL; X->Ast = ~0ULL;
+        if (X->kt <= 12) {
+            long n = 1L << X->kt; X->V = malloc(sizeof(uint16_t) * n); X->V[0] = 0;
+            for (long v = 1; v < n; v++) { int j = __builtin_ctzl(v); X->V[v] = X->V[v & (v - 1)] ^ (uint16_t)X->col[j]; }
+            bytes += n * 2;
+        }
+        if (t < 2) continue;
+        int k1 = vstart[t] - vstart[t - 1], k2 = vstart[t - 1] - vstart[t - 2];
+        if (k1 > 13 || k2 > 13) continue;
+        u128 mA = (vstart[t - 2] == 0) ? 0 : ((((u128)1) << vstart[t - 2]) - 1);
+        for (int s = 0; s < X->m; s++) X->lowA[s] = X->fm[s] & mA;
+        X->U1 = malloc(sizeof(uint16_t) << k1); X->U2 = malloc(sizeof(uint16_t) << k2);
+        uint32_t c1[16] = {0}, c2[16] = {0};   // per level variable j: syndrome column (m bits)
+        for (int s = 0; s < X->m; s++) {
+            for (int j = 0; j < k1; j++) if ((X->fm[s] >> (vstart[t - 1] + j)) & 1) c1[j] |= 1u << s;
+            for (int j = 0; j < k2; j++) if ((X->fm[s] >> (vstart[t - 2] + j)) & 1) c2[j] |= 1u << s;
+        }
+        X->U1[0] = 0; for (long v = 1; v < (1L << k1); v++) { int j = __builtin_ctzl(v); X->U1[v] = X->U1[v & (v - 1)] ^ (uint16_t)c1[j]; }
+        X->U2[0] = 0; for (long v = 1; v < (1L << k2); v++) { int j = __builtin_ctzl(v); X->U2[v] = X->U2[v & (v - 1)] ^ (uint16_t)c2[j]; }
+        bytes += (2L << k1) + (2L << k2); X->usetab = 1;
+    }
+    if (getenv("LWE9VERB")) fprintf(stderr, "lwe9 tables: %.1f MB\n", bytes / 1048576.0);
+}
+
+static const u64 TMASK[6] = {0x5555555555555555ULL, 0x3333333333333333ULL, 0x0F0F0F0F0F0F0F0FULL,
+                              0x00FF00FF00FF00FFULL, 0x0000FFFF0000FFFFULL, 0x00000000FFFFFFFFULL};
+// out[i] = bitmap translated by XOR with d:  out bit (v ^ d) = in bit v
+static inline void xor_translate(u64 *out, const u64 *in, int nw, uint32_t d) {
+    int hi = (int)(d >> 6);
+    for (int i = 0; i < nw; i++) out[i ^ hi] = in[i];
+    for (int j = 0; j < 6; j++) if ((d >> j) & 1) {
+        int sh = 1 << j; u64 M = TMASK[j];
+        for (int i = 0; i < nw; i++) { u64 w = out[i]; out[i] = ((w & M) << sh) | ((w >> sh) & M); }
+    }
+}
+static int ordkey_cmp(const void *a, const void *b) {
+    const Con *x = &C[*(const int *)a], *y = &C[*(const int *)b];
+    // method 2 first (no level variables), then larger reachable-bad fraction (lower weight), then higher rank
+    int mx = x->method == 2 ? 0 : 1, my = y->method == 2 ? 0 : 1;
+    if (mx != my) return mx - my;
+    if (x->wt != y->wt) return x->wt - y->wt;
+    return y->rank - x->rank;
+}
+static void make_order(void) {
+    ORD = malloc(sizeof(int) * NC);
+    for (int c = 0; c < NC; c++) ORD[c] = c;
+    for (int t = 0; t < NLEV; t++) qsort(ORD + lstart[t], lstart[t + 1] - lstart[t], sizeof(int), ordkey_cmp);
+}
+static int syndrome_of(int c);
+static void read_ltsr(const char *fn) {
+    FILE *f = fopen(fn, "r"); if (!f) die("open ltsr");
+    char tag[16]; if (fscanf(f, "%15s %d %d", tag, &LRr, &LRnG) != 3 || strcmp(tag, "LTSR")) die("ltsr hdr");
+    if (LRr < 1 || LRr > 16) die("ltsr r");
+    for (int i = 0; i < LRr; i++) if (fscanf(f, "%d %d", &LRc[i], &LRm[i]) != 2 || LRm[i] > 16) die("ltsr key");
+    LRgc = malloc(sizeof(int) * (size_t)LRnG * LRr); LRrows = calloc((size_t)LRnG * LRr * 16, sizeof(uint16_t));
+    for (int g = 0; g < LRnG; g++) for (int i = 0; i < LRr; i++) {
+        if (fscanf(f, "%d", &LRgc[(size_t)g * LRr + i]) != 1) die("ltsr gc");
+        for (int j = 0; j < LRm[i]; j++) { unsigned x; if (fscanf(f, "%u", &x) != 1) die("ltsr row"); LRrows[((size_t)g * LRr + i) * 16 + j] = (uint16_t)x; }
+    }
+    fclose(f);
+    // static triggers: component i comparable at level max(lv(c_{g,i}), lv(c_i)) + 1; prefix j comparable at T_j
+    int *cnt = calloc(NLEV + 2, sizeof(int));
+    int *Tj = malloc(sizeof(int) * (LRr + 1));
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) { LRls = calloc(NLEV + 3, sizeof(int)); for (int t = 0; t <= NLEV + 1; t++) LRls[t + 1] = LRls[t] + cnt[t];
+                         LRlg = malloc(sizeof(int) * (LRls[NLEV + 2] + 1)); LRlj = malloc(sizeof(int) * (LRls[NLEV + 2] + 1)); memset(cnt, 0, sizeof(int) * (NLEV + 2)); }
+        for (int g = 0; g < LRnG; g++) {
+            Tj[0] = 0;
+            for (int j = 1; j <= LRr; j++) {
+                int a = C[LRgc[(size_t)g * LRr + j - 1]].lv, b = C[LRc[j - 1]].lv;
+                int lv = (a > b ? a : b) + 1; Tj[j] = Tj[j - 1] > lv ? Tj[j - 1] : lv;
+            }
+            for (int j = 1; j <= LRr; j++) {
+                if (j < LRr && Tj[j + 1] == Tj[j]) continue;      // only the longest prefix per trigger level
+                int t = Tj[j]; if (t > NLEV) t = NLEV;
+                if (pass == 0) cnt[t]++;
+                else { int pos = LRls[t] + cnt[t]++; LRlg[pos] = g; LRlj[pos] = j; }
+            }
+        }
+    }
+    // deterministic shuffle within each level (order does not affect which nodes are pruned)
+    unsigned long long st = 0x2545F4914F6CDD1DULL;
+    for (int t = 0; t <= NLEV; t++) for (int a = LRls[t + 1] - 1; a > LRls[t]; a--) {
+        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        int b = LRls[t] + (int)(st % (unsigned long long)(a - LRls[t] + 1));
+        int x = LRlg[a]; LRlg[a] = LRlg[b]; LRlg[b] = x; x = LRlj[a]; LRlj[a] = LRlj[b]; LRlj[b] = x;
+    }
+    SCval = malloc(sizeof(int) * NC); SCstamp = calloc(NC, sizeof(unsigned));
+    free(cnt); free(Tj); LR = 1;
+}
+static inline int syn_cached(int c);
+static void read_ltsh(const char *fn) {
+    FILE *f = fopen(fn, "r"); if (!f) die("open ltsh");
+    char tag[16];
+    if (fscanf(f, "%15s %d %d %d %d %d %d %d", tag, &LHr, &LHm0, &LHc0, &LHnO, &LHnS0, &LHnG, &LHncls) != 8 || strcmp(tag, "LTSH")) die("ltsh hdr");
+    for (int i = 0; i < LHr; i++) if (fscanf(f, "%d %d", &LHc[i], &LHm[i]) != 2 || LHm[i] > 16) die("ltsh key");
+    int M = 1 << LHm0;
+    LHcanon = malloc(sizeof(int) * M); LHh = malloc(sizeof(int) * M); LHclsOf = malloc(sizeof(int) * M);
+    for (int i = 0; i < M; i++) if (fscanf(f, "%d", &LHcanon[i]) != 1) die("ltsh canon");
+    for (int i = 0; i < M; i++) if (fscanf(f, "%d", &LHh[i]) != 1) die("ltsh h");
+    for (int i = 0; i < M; i++) LHclsOf[i] = -1;
+    LHJs = malloc(sizeof(int) * (LHncls + 1)); int cap = 1024, used = 0; LHJ = malloc(sizeof(int) * cap);
+    for (int k = 0; k < LHncls; k++) {
+        int c, n; if (fscanf(f, "%d %d", &c, &n) != 2) die("ltsh cls"); LHclsOf[c] = k; LHJs[k] = used;
+        for (int q = 0; q < n; q++) { if (used >= cap) { cap *= 2; LHJ = realloc(LHJ, sizeof(int) * cap); } if (fscanf(f, "%d", &LHJ[used]) != 1) die("ltsh J"); used++; }
+    }
+    LHJs[LHncls] = used;
+    LHmul = malloc(sizeof(int) * (size_t)LHnS0 * LHnS0);
+    for (size_t i = 0; i < (size_t)LHnS0 * LHnS0; i++) if (fscanf(f, "%d", &LHmul[i]) != 1) die("ltsh mul");
+    LHuc = malloc(sizeof(int) * LHnO); LHut = calloc((size_t)LHnO * 16, sizeof(uint16_t)); LHcomp = malloc(sizeof(int) * (size_t)LHnO * LHnS0);
+    for (int u = 0; u < LHnO; u++) {
+        if (fscanf(f, "%d", &LHuc[u]) != 1) die("ltsh uc");
+        for (int j = 0; j < LHm0; j++) { unsigned x; if (fscanf(f, "%u", &x) != 1) die("ltsh ut"); LHut[(size_t)u * 16 + j] = (uint16_t)x; }
+        for (int q = 0; q < LHnS0; q++) if (fscanf(f, "%d", &LHcomp[(size_t)u * LHnS0 + q]) != 1) die("ltsh comp");
+    }
+    if (LHr > 1) {
+        LHgc = malloc(sizeof(int) * (size_t)LHnG * (LHr - 1)); LHgt = calloc((size_t)LHnG * (LHr - 1) * 16, sizeof(uint16_t));
+        LHtrig = calloc(LHnG, sizeof(unsigned));
+        for (int g = 0; g < LHnG; g++) for (int i = 1; i < LHr; i++) {
+            size_t o = (size_t)g * (LHr - 1) + (i - 1);
+            if (fscanf(f, "%d", &LHgc[o]) != 1) die("ltsh gc");
+            for (int j = 0; j < LHm[i]; j++) { unsigned x; if (fscanf(f, "%u", &x) != 1) die("ltsh gt"); LHgt[o * 16 + j] = (uint16_t)x; }
+            int a = C[LHgc[o]].lv, b = C[LHc[i]].lv; int L = (a > b ? a : b) + 1; if (L > 31) die("ltsh level");
+            LHtrig[g] |= 1u << L;
+        }
+    }
+    fclose(f);
+    if (!SCval) { SCval = malloc(sizeof(int) * NC); SCstamp = calloc(NC, sizeof(unsigned)); }
+    EPval = malloc(sizeof(int) * NC); EPst = malloc(sizeof(unsigned long long) * NC); for (int c = 0; c < NC; c++) EPst[c] = ~0ULL;
+    UAval = malloc(sizeof(int) * LHnO); UCval = malloc(sizeof(int) * LHnO); UCst = malloc(sizeof(unsigned long long) * LHnO);
+    for (int u = 0; u < LHnO; u++) UCst[u] = ~0ULL;
+    LH = 1;
+}
+static inline int tr16(const uint16_t *R, int m, int s) { int x = 0; for (int q = 0; q < m; q++) x |= (__builtin_popcount(R[q] & (unsigned)s) & 1) << q; return x; }
+static inline int syn_fast(int c);
+static uint16_t **TGlo, **TGhi, **TUlo, **TUhi;   // lwe11: transports T_{g,i} and t_u as split tables (lo byte, high bits)
+static unsigned char *gskip, *ctriv;              // g whose components are all trivial (always equal); trivial component
+static inline int syn_ep(int c) {          // syndrome of constraint c (all its variables assigned), cached per ancestor
+    unsigned long long e = nid[C[c].lv + 1];
+    if (EPst[c] != e) { EPst[c] = e; EPval[c] = syn_fast(c); }
+    return EPval[c];
+}
+static int lh_check_g(int g, int t) {      // components 1..r-1, lexicographic; 1 = transported key smaller (prune)
+    for (int i = 1; i < LHr; i++) {
+        size_t o = (size_t)g * (LHr - 1) + (i - 1);
+        int c = LHgc[o];
+        if (C[c].lv > t - 1 || C[LHc[i]].lv > t - 1) return 0;
+        if (ctriv[o]) continue;                     // c = c_i and T = I: always equal
+        int sc = syn_ep(c);
+        int x = TGlo[o][sc & 255] ^ TGhi[o][sc >> 8], y = syn_ep(LHc[i]);
+        if (x < y) return 1;
+        if (x > y) return 0;
+    }
+    return 0;
+}
+static int lh_reject(int t) {
+    int lv0 = C[LHc0].lv;
+    if (t - 1 < lv0) return 0;
+    int s0 = syn_ep(LHc0);
+    if (lv0 == t - 1 && LHcanon[s0] != s0) return 1;
+    int cls = LHclsOf[s0]; if (cls < 0) return 1;   /* cannot happen: s0 canonical */
+    int Jn = LHJs[cls + 1] - LHJs[cls]; const int *J = &LHJ[LHJs[cls]];
+    for (int u = 0; u < LHnO; u++) {
+        int cu = LHuc[u]; int lu = C[cu].lv > lv0 ? C[cu].lv : lv0;
+        if (lu > t - 1) continue;
+        int newu = (lu == t - 1);
+        int a, ca;
+        unsigned long long e = nid[lu + 1];
+        if (UCst[u] == e) { a = UAval[u]; ca = UCval[u]; }
+        else {
+            if (u == 0) a = s0; else { int su = syn_ep(cu); a = TUlo[u][su & 255] ^ TUhi[u][su >> 8]; }
+            ca = LHcanon[a]; UAval[u] = a; UCval[u] = ca; UCst[u] = e;
+        }
+        if (ca < s0) { if (newu) return 1; continue; }
+        if (ca != s0 || LHr < 2) continue;
+        int h = LHh[a];
+        for (int q = 0; q < Jn; q++) {
+            int sig = LHmul[(size_t)h * LHnS0 + J[q]];
+            int g = LHcomp[(size_t)u * LHnS0 + sig];
+            if (gskip[g]) continue;                 // lh_check_g(g, .) is always 0
+            if (!newu && !((LHtrig[g] >> t) & 1)) continue;
+            if (lh_check_g(g, t)) return 1;
+        }
+    }
+    return 0;
+}
+static inline int syn_cached(int c) {
+    if (SCstamp[c] != SCcur) { SCstamp[c] = SCcur; SCval[c] = syndrome_of(c); }
+    return SCval[c];
+}
+static int ltsr_reject(int t) {
+    if (t > NLEV) return 0;
+    SCcur++;
+    for (int e = LRls[t]; e < LRls[t + 1]; e++) {
+        int g = LRlg[e], j = LRlj[e];
+        for (int i = 0; i < j; i++) {
+            int su = syn_cached(LRgc[(size_t)g * LRr + i]);
+            const uint16_t *R = &LRrows[((size_t)g * LRr + i) * 16];
+            int x = 0; for (int q = 0; q < LRm[i]; q++) x |= (__builtin_popcount(R[q] & (unsigned)su) & 1) << q;
+            int y = syn_cached(LRc[i]);
+            if (x < y) return 1;
+            if (x > y) break;
+        }
+    }
+    return 0;
+}
+static int syndrome_of(int c) {
+    const Con *X = &C[c]; int sv = 0;
+    for (int q = 0; q < X->m; q++) sv |= (par128(X->fm[q] & asg) ^ X->fc[q]) << q;
+    return sv;
+}
+static int sym_reject(int t) {   // 1 = prune this node (all variables of levels < t are assigned)
+    if (t == 0 || C[SC0].lv >= t) return 0;
+    int s0 = syndrome_of(SC0);
+    if (C[SC0].lv == t - 1 && scanon[s0] != s0) return 1;
+    for (int e = 0; e < SNE; e++) {
+        int c = sent_c[e]; if (C[c].lv != t - 1) continue;
+        int su = syndrome_of(c), tr = 0;
+        for (int j = 0; j < SM; j++) tr |= (__builtin_popcount(sent_rows[e * SM + j] & (uint32_t)su) & 1) << j;
+        if (scanon[tr] < s0) return 1;
+    }
+    return 0;
+}
+// ---- lwe11: fast level filter (AVX-512 VBMI + GFNI) ----
+// Per level t the constraints get lanes in processing order: rank-0 constraints first (whole node), then the
+// translate constraints, then the rest (checked child by child).  s0 of every lane is one uint16 vector
+// P[t] = fc ^ sum_{l<t} row_l(x_l), kept along the path: P[e] = P[e-1] ^ (chunk rows of x_{e-1}), stamped nid[e].
+// Translate constraint: bad children of s0 = base[coset(s0)] XOR-translated by v0(s0), where
+// s0 = crep ^ L v0 (reduction modulo Im L); (coset, v0) = cvlo[s0 & 255] ^ cvhi[s0 >> 8] (the reduction is linear).
+typedef struct {
+    const uint32_t *cvlo, *cvhi;      // (coset << 16) | v0
+    const uint8_t *base;              // one bitmap of 'stride' = 1 << sh bytes per coset of Im L (+64 bytes padding)
+    const uint16_t *vlo, *vhi;        // L x = vlo[x & 255] ^ vhi[x >> 8] (list mode, kt >= 10)
+    int sh;
+} FC;
+typedef struct {
+    int on, kt, nbytes, nz, nwords, nc, npad, nr0, ntr, vec, thr;
+    int *cid;                         // constraint index per lane
+    FC *fc;                           // translate records for lanes nr0 .. nr0+ntr-1
+    uint16_t *PB; unsigned long long *PBst;
+    uint16_t *chunk[40][4];           // chunk[l][q]: 16 rows of npad lanes (bits 4q..4q+3 of x_l)
+    u64 *allm;                        // nz*8 words: low 2^kt bits set
+} LV;
+static LV LVL[40];
+static int nchunk[41];
+static u64 xv[41];                    // value of level l on the current path
+static unsigned char lhact[42];       // lh_reject can return 1 at level t
+static __m512i IOTA;
+static u64 AFF[8];
+static int CHECK = 0, LH2 = 1;                 // LWE11CHECK: verify s0 vectors and alive sets against a direct computation
+static long long fastnodes = 0, checknodes = 0;
+static int *laneOf; static uint16_t **SVlo, **SVhi; static unsigned char *need_sv;
+
+static void *amalloc(size_t n) { void *p = aligned_alloc(64, (n + 63) / 64 * 64 + 64); if (!p) die("alloc"); memset(p, 0, (n + 63) / 64 * 64 + 64); return p; }
+static inline uint32_t colL(const Con *X, int l, int j) {   // syndrome column of variable j of level l
+    uint32_t v = 0; for (int s = 0; s < X->m; s++) v |= (uint32_t)((X->fm[s] >> (vstart[l] + j)) & 1) << s; return v;
+}
+static uint32_t reduce_cv(const Con *X, uint32_t s0) {      // (coset index << 16) | v0 with s0 = crep ^ L v0
+    uint32_t sv = s0, v0 = 0;
+    for (int q = 0; q < X->irank; q++) if ((sv >> X->ipiv[q]) & 1) { sv ^= X->ivec[q]; v0 ^= X->ipre[q]; }
+    uint32_t ci = 0; for (int q = 0; q < X->m - X->irank; q++) if ((sv >> X->cbits[q]) & 1) ci |= 1u << q;
+    return (ci << 16) | v0;
+}
+static void build_fast(void) {
+    need_sv = calloc(NC + 1, 1);
+    for (int j = 0; j < 8; j++) { u64 A = 0; for (int i = 0; i < 8; i++) A |= (u64)(1u << (i ^ j)) << (8 * (7 - i)); AFF[j] = A; }
+    { uint8_t io[64]; for (int i = 0; i < 64; i++) io[i] = (uint8_t)i; IOTA = _mm512_loadu_si512(io); }
+    for (int l = 0; l <= NLEV; l++) { int k = (l < NLEV) ? vstart[l + 1] - vstart[l] : 0; nchunk[l] = (k + 3) / 4; }
+    const char *thr = getenv("LWE11THR");
+    long tbytes = 0, vbytes = 0; long vbudget = 24L << 20;
+    for (int t = 0; t < NLEV; t++) {
+        LV *L = &LVL[t]; memset(L, 0, sizeof(LV));
+        int kt = vstart[t + 1] - vstart[t];
+        if (kt > 16 || getenv("LWE11OFF")) continue;
+        L->kt = kt; L->nbytes = kt >= 3 ? 1 << (kt - 3) : 1; L->nz = L->nbytes >= 64 ? L->nbytes / 64 : 1;
+        L->nwords = kt >= 6 ? 1 << (kt - 6) : 1;
+        L->thr = thr ? atoi(thr) : (L->nz <= 2 ? 0 : 4 * L->nz); if (L->thr > 48) L->thr = 48;
+        int nc = lstart[t + 1] - lstart[t]; L->nc = nc; L->npad = (nc + 31) / 32 * 32; if (L->npad == 0) L->npad = 32;
+        L->cid = malloc(sizeof(int) * (nc + 1)); L->fc = calloc(nc + 1, sizeof(FC));
+        // classify in ORD order: rank 0, translate (base fits), rest
+        int *cls = malloc(sizeof(int) * (nc + 1));
+        for (int i = 0; i < nc; i++) {
+            Con *X = &C[ORD[lstart[t] + i]];
+            if (X->rank == 0) cls[i] = 0;
+            else { long ncos = 1L << (X->m - X->irank); cls[i] = (ncos * L->nbytes <= 32768) ? 1 : 2; }
+        }
+        int pos = 0;
+        for (int k = 0; k < 3; k++) for (int i = 0; i < nc; i++) if (cls[i] == k) L->cid[pos++] = ORD[lstart[t] + i];
+        L->nr0 = 0; L->ntr = 0; for (int i = 0; i < nc; i++) { if (cls[i] == 0) L->nr0++; if (cls[i] == 1) L->ntr++; }
+        free(cls);
+        for (int i = L->nr0; i < L->nr0 + L->ntr; i++) {
+            Con *X = &C[L->cid[i]]; FC *F = &L->fc[i];
+            int m = X->m; long ns = 1L << m; int sh = 0; while ((1 << sh) < L->nbytes) sh++;
+            F->sh = sh;
+            long nh = ns > 64 ? ns >> 6 : 1;
+            uint32_t *lo = amalloc(sizeof(uint32_t) * 64), *hi = amalloc(sizeof(uint32_t) * nh);
+            #define CVOFF(v) ((((v) >> 16) << (16 + sh)) | ((v) & 0xFFFF))
+            for (long s = 0; s < 64; s++) lo[s] = (s < ns) ? CVOFF(reduce_cv(X, (uint32_t)s)) : 0;
+            hi[0] = 0; for (long h = 1; h < nh; h++) hi[h] = CVOFF(reduce_cv(X, (uint32_t)(h << 6)));
+            for (long s = 0; s < ns; s++) if ((lo[s & 63] ^ hi[s >> 6]) != CVOFF(reduce_cv(X, (uint32_t)s))) die("cv not linear");
+            F->cvlo = lo; F->cvhi = hi; tbytes += 4 * (64 + nh);
+            long ncos = 1L << (m - X->irank);
+            uint8_t *B = amalloc((size_t)ncos * L->nbytes + 64);
+            for (long ci = 0; ci < ncos; ci++) {
+                uint32_t crep = 0; for (int q = 0; q < m - X->irank; q++) if ((ci >> q) & 1) crep |= 1u << X->cbits[q];
+                uint8_t *b = B + ci * L->nbytes; uint32_t sv = crep;
+                for (long v = 0; v < (1L << kt); v++) {
+                    if (v) sv ^= X->col[__builtin_ctzl(v)];
+                    long g = v ^ (v >> 1);
+                    if ((X->badbm[sv >> 6] >> (sv & 63)) & 1) b[g >> 3] |= (uint8_t)(1u << (g & 7));
+                }
+            }
+            F->base = B; tbytes += ncos * L->nbytes;
+            if (kt >= 10) {
+                uint16_t *vl = malloc(sizeof(uint16_t) * 256), *vh = malloc(sizeof(uint16_t) * (1 << (kt - 8)));
+                for (int x = 0; x < 256; x++) { uint32_t a = 0; for (int j = 0; j < 8 && j < kt; j++) if ((x >> j) & 1) a ^= X->col[j]; vl[x] = (uint16_t)a; }
+                for (int x = 0; x < (1 << (kt - 8)); x++) { uint32_t a = 0; for (int j = 0; j < kt - 8; j++) if ((x >> j) & 1) a ^= X->col[8 + j]; vh[x] = (uint16_t)a; }
+                F->vlo = vl; F->vhi = vh;
+            }
+        }
+        L->allm = amalloc(sizeof(u64) * L->nz * 8);
+        for (long v = 0; v < (1L << kt); v++) L->allm[v >> 6] |= 1ULL << (v & 63);
+        // s0 vector chain
+        long need = 0; for (int l = 0; l < t; l++) need += (long)nchunk[l] * 16 * L->npad * 2;
+        need += (long)(t + 1) * L->npad * 2;
+        if (need <= (4L << 20) && vbytes + need <= vbudget) {
+            L->vec = 1; vbytes += need;
+            L->PB = amalloc(sizeof(uint16_t) * (size_t)(t + 1) * L->npad); L->PBst = calloc(t + 1, sizeof(unsigned long long));
+            for (int i = 0; i < nc; i++) { const Con *X = &C[L->cid[i]]; uint32_t f = 0; for (int s = 0; s < X->m; s++) f |= (uint32_t)X->fc[s] << s; L->PB[i] = (uint16_t)f; }
+            for (int l = 0; l < t; l++) {
+                int k = vstart[l + 1] - vstart[l];
+                for (int q = 0; q < nchunk[l]; q++) {
+                    uint16_t *T = amalloc(sizeof(uint16_t) * 16 * L->npad); L->chunk[l][q] = T;
+                    for (int i = 0; i < nc; i++) {
+                        const Con *X = &C[L->cid[i]]; uint32_t cl[4];
+                        for (int j = 0; j < 4; j++) cl[j] = (4 * q + j < k) ? colL(X, l, 4 * q + j) : 0;
+                        for (int r = 0; r < 16; r++) { uint32_t a = 0; for (int j = 0; j < 4; j++) if ((r >> j) & 1) a ^= cl[j]; T[(size_t)r * L->npad + i] = (uint16_t)a; }
+                    }
+                }
+            }
+        }
+        L->on = 1;
+    }
+    if (LH) {
+        int lv0 = C[LHc0].lv;
+        for (int t = 0; t <= NLEV; t++) {
+            int a = 0;
+            if (t - 1 >= lv0) {
+                if (lv0 == t - 1) a = 1;
+                for (int u = 0; u < LHnO; u++) { int lu = C[LHuc[u]].lv > lv0 ? C[LHuc[u]].lv : lv0; if (lu == t - 1) a = 1; }
+                if (LHr >= 2) { if (t >= 32) a = 1; else for (int g = 0; g < LHnG; g++) if ((LHtrig[g] >> t) & 1) a = 1; }
+            }
+            lhact[t] = (unsigned char)a;
+        }
+        if (getenv("LWE11NOSKIP")) for (int t = 0; t <= NLEV; t++) lhact[t] = 1;
+        // transports as split tables; trivial components / elements
+        int nO = LHnO, nGo = LHr > 1 ? LHnG * (LHr - 1) : 0;
+        TUlo = calloc(nO + 1, sizeof(uint16_t *)); TUhi = calloc(nO + 1, sizeof(uint16_t *));
+        for (int u = 0; u < nO; u++) {
+            int mi = C[LHuc[u]].m; long nh = mi > 8 ? 1L << (mi - 8) : 1;
+            TUlo[u] = malloc(sizeof(uint16_t) * 256); TUhi[u] = malloc(sizeof(uint16_t) * nh);
+            for (int b = 0; b < 256; b++) TUlo[u][b] = (uint16_t)tr16(&LHut[(size_t)u * 16], LHm0, b);
+            for (long h = 0; h < nh; h++) TUhi[u][h] = (uint16_t)tr16(&LHut[(size_t)u * 16], LHm0, (int)(h << 8));
+            need_sv[LHuc[u]] = 1;
+        }
+        TGlo = calloc(nGo + 1, sizeof(uint16_t *)); TGhi = calloc(nGo + 1, sizeof(uint16_t *));
+        ctriv = calloc(nGo + 1, 1); gskip = calloc(LHnG + 1, 1);
+        for (int g = 0; g < LHnG; g++) {
+            int all = (LHr > 1);
+            for (int i = 1; i < LHr; i++) {
+                size_t o = (size_t)g * (LHr - 1) + (i - 1); int c = LHgc[o]; int mi = C[c].m; long nh = mi > 8 ? 1L << (mi - 8) : 1;
+                TGlo[o] = malloc(sizeof(uint16_t) * 256); TGhi[o] = malloc(sizeof(uint16_t) * nh);
+                for (int b = 0; b < 256; b++) TGlo[o][b] = (uint16_t)tr16(&LHgt[o * 16], LHm[i], b);
+                for (long h = 0; h < nh; h++) TGhi[o][h] = (uint16_t)tr16(&LHgt[o * 16], LHm[i], (int)(h << 8));
+                int triv = (c == LHc[i]); for (int j = 0; j < LHm[i]; j++) if (LHgt[o * 16 + j] != (1u << j)) triv = 0;
+                ctriv[o] = (unsigned char)triv; if (!triv) all = 0;
+                need_sv[c] = 1; need_sv[LHc[i]] = 1;
+            }
+            gskip[g] = (unsigned char)all;
+            if (getenv("LWE11NOGSKIP")) gskip[g] = 0;
+        }
+        need_sv[LHc0] = 1;
+        if (getenv("LWE11VERB")) { int ns = 0; for (int g = 0; g < LHnG; g++) ns += gskip[g]; fprintf(stderr, "lwe11: %d always-equal group elements skipped\n", ns); }
+    }
+    // L x tables for constraints whose syndromes the symmetry test reads (fast syndromes from the s0 vectors)
+    laneOf = malloc(sizeof(int) * NC); for (int c = 0; c < NC; c++) laneOf[c] = -1;
+    for (int t = 0; t < NLEV; t++) if (LVL[t].on) for (int i = 0; i < LVL[t].nc; i++) laneOf[LVL[t].cid[i]] = i;
+    SVlo = calloc(NC, sizeof(uint16_t *)); SVhi = calloc(NC, sizeof(uint16_t *));
+    for (int c = 0; c < NC; c++) if (need_sv[c] && laneOf[c] >= 0 && C[c].kt <= 16) {
+        const Con *X = &C[c]; int kt = X->kt; long nh = kt > 8 ? 1L << (kt - 8) : 1;
+        SVlo[c] = malloc(sizeof(uint16_t) * 256); SVhi[c] = malloc(sizeof(uint16_t) * nh);
+        for (int x = 0; x < 256; x++) { uint32_t a = 0; for (int j = 0; j < 8 && j < kt; j++) if ((x >> j) & 1) a ^= X->col[j]; SVlo[c][x] = (uint16_t)a; }
+        for (long x = 0; x < nh; x++) { uint32_t a = 0; for (int j = 0; j < kt - 8; j++) if ((x >> j) & 1) a ^= X->col[8 + j]; SVhi[c][x] = (uint16_t)a; }
+    }
+    if (getenv("LWE11VERB")) {
+        fprintf(stderr, "lwe11: translate tables %.2f MB, s0 vector tables %.2f MB\n", tbytes / 1048576.0, vbytes / 1048576.0);
+        for (int t = 0; t < NLEV; t++) { LV *L = &LVL[t]; fprintf(stderr, " L%d on %d kt %d nc %d r0 %d tr %d rest %d vec %d thr %d lhact %d\n", t, L->on, L->kt, L->nc, L->nr0, L->ntr, L->nc - L->nr0 - L->ntr, L->vec, L->thr, lhact[t]); }
+    }
+}
+static inline const uint16_t *s0vec(LV *L, int t) {
+    int e = t;
+    while (e > 0 && L->PBst[e] != nid[e]) e--;
+    const int np = L->npad;
+    for (int f = e + 1; f <= t; f++) {
+        const int l = f - 1, nq = nchunk[l]; const unsigned x = (unsigned)xv[l];
+        const uint16_t *src = L->PB + (size_t)(f - 1) * np; uint16_t *dst = L->PB + (size_t)f * np;
+        const uint16_t *r0 = nq > 0 ? L->chunk[l][0] + (size_t)(x & 15) * np : NULL;
+        const uint16_t *r1 = nq > 1 ? L->chunk[l][1] + (size_t)((x >> 4) & 15) * np : NULL;
+        const uint16_t *r2 = nq > 2 ? L->chunk[l][2] + (size_t)((x >> 8) & 15) * np : NULL;
+        const uint16_t *r3 = nq > 3 ? L->chunk[l][3] + (size_t)((x >> 12) & 15) * np : NULL;
+        for (int i = 0; i < np; i += 32) {
+            __m512i a = _mm512_load_si512((const void *)(src + i));
+            if (nq > 0) a = _mm512_xor_si512(a, _mm512_load_si512((const void *)(r0 + i)));
+            if (nq > 1) a = _mm512_xor_si512(a, _mm512_load_si512((const void *)(r1 + i)));
+            if (nq > 2) a = _mm512_xor_si512(a, _mm512_load_si512((const void *)(r2 + i)));
+            if (nq > 3) a = _mm512_xor_si512(a, _mm512_load_si512((const void *)(r3 + i)));
+            _mm512_store_si512((void *)(dst + i), a);
+        }
+        L->PBst[f] = nid[f];
+    }
+    return L->PB + (size_t)t * np;
+}
+static inline int syn_fast(int c) {   // syndrome of c from the s0 vector of its level on the current path
+    const int l = C[c].lv; const LV *L = &LVL[l];
+    if (SVlo[c] && L->vec) {
+        const uint32_t x = (uint32_t)xv[l];
+        int s = L->PB[(size_t)l * L->npad + laneOf[c]] ^ SVlo[c][x & 255] ^ SVhi[c][x >> 8];
+        if (CHECK && (s != syndrome_of(c) || L->PBst[l] != nid[l])) { fprintf(stderr, "CHECK syn_fast mismatch c %d level %d\n", c, l); exit(3); }
+        return s;
+    }
+    return syndrome_of(c);
+}
+static inline uint32_t lane_s0(LV *L, const uint16_t *S, int i) { return L->vec ? S[i] : (uint32_t)syn0(&C[L->cid[i]]); }
+static inline int bad_child(const Con *X, uint32_t s0, uint32_t v) {
+    uint32_t sv = s0; while (v) { sv ^= X->col[__builtin_ctz(v)]; v &= v - 1; }
+    return (int)((X->badbm[sv >> 6] >> (sv & 63)) & 1);
+}
+static void check_node(LV *L, int t, const uint16_t *S, const u64 *alive, int dead) {   // LWE11CHECK
+    checknodes++;
+    if (L->vec) for (int i = 0; i < L->nc; i++) if (S[i] != (uint16_t)syn0_plain(&C[L->cid[i]])) { fprintf(stderr, "CHECK s0 mismatch level %d lane %d\n", t, i); exit(3); }
+    static uint32_t s0d[8192];
+    for (int i = 0; i < L->nc; i++) s0d[i] = (uint32_t)syn0_plain(&C[L->cid[i]]);
+    for (long v = 0; v < (1L << L->kt); v++) {
+        int ok = 1;
+        for (int i = 0; i < L->nc && ok; i++) { const Con *X = &C[L->cid[i]]; if (bad_child(X, s0d[i], (uint32_t)v)) ok = 0; }
+        int got = dead ? 0 : (int)((alive[v >> 6] >> (v & 63)) & 1);
+        if (ok != got) { fprintf(stderr, "CHECK alive mismatch level %d child %ld: direct %d fast %d\n", t, v, ok, got); exit(3); }
+    }
+}
+
+#ifdef PROFPC
+#include <sys/time.h>
+#include <ucontext.h>
+static volatile int curlev = 0;
+static unsigned long *pcbuf; static volatile long npc = 0; static int levhist[64];
+static void onprof(int sg, siginfo_t *si, void *uc) { (void)sg; (void)si; if (npc < (1L << 22)) pcbuf[npc++] = (unsigned long)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP]; levhist[curlev & 63]++; }
+static void prof_start(void) { pcbuf = malloc(sizeof(unsigned long) << 22); struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = onprof; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigaction(SIGPROF, &sa, NULL);
+    struct itimerval it = {{0, 500}, {0, 500}}; setitimer(ITIMER_PROF, &it, NULL); }
+static void prof_dump(void) { struct itimerval it = {{0, 0}, {0, 0}}; setitimer(ITIMER_PROF, &it, NULL);
+    FILE *f = fopen(getenv("PROFOUT"), "w"); for (long i = 0; i < npc; i++) fprintf(f, "%lx\n", pcbuf[i]); fclose(f);
+    long tot = 0; for (int l = 0; l < 64; l++) tot += levhist[l]; for (int l = 0; l < 64; l++) if (levhist[l]) fprintf(stderr, "PROF level %d: %.1f%%\n", l, 100.0 * levhist[l] / tot); }
+#define SETLEV(t) (curlev = (t))
+#else
+#define SETLEV(t) ((void)0)
+#endif
+// lh_reject2: same decision as lh_reject.  Only orbit words completed at level t-1 ("new") are transported; an older
+// word can matter only if it tied (canonical transported value = s0) when it was new, so ties are recorded per level
+// on the current path and only their elements with a trigger at level t are compared.
+static int lhnewn[42]; static int *lhnew[42];
+static int tien[42]; static int tieu[42][256]; static int tieh[42][256];
+static void build_lh2(void) {
+    int lv0 = C[LHc0].lv;
+    for (int t = 0; t <= NLEV + 1 && t < 42; t++) { lhnewn[t] = 0; lhnew[t] = malloc(sizeof(int) * (LHnO + 1)); tien[t] = 0; }
+    for (int u = 0; u < LHnO; u++) { int lu = C[LHuc[u]].lv > lv0 ? C[LHuc[u]].lv : lv0; if (lu + 1 < 42) lhnew[lu + 1][lhnewn[lu + 1]++] = u; }
+}
+static int lh_reject2(int t) {
+    int lv0 = C[LHc0].lv;
+    if (t - 1 < lv0) return 0;
+    int s0 = syn_ep(LHc0);
+    if (lv0 == t - 1 && LHcanon[s0] != s0) return 1;
+    int cls = LHclsOf[s0]; if (cls < 0) return 1;   /* cannot happen: s0 canonical */
+    int Jn = LHJs[cls + 1] - LHJs[cls]; const int *J = &LHJ[LHJs[cls]];
+    tien[t] = 0;
+    for (int k = 0; k < lhnewn[t]; k++) {
+        int u = lhnew[t][k], a;
+        if (u == 0) a = s0; else { int su = syn_ep(LHuc[u]); a = TUlo[u][su & 255] ^ TUhi[u][su >> 8]; }
+        int ca = LHcanon[a];
+        if (ca < s0) return 1;
+        if (ca != s0 || LHr < 2) continue;
+        int h = LHh[a];
+        if (tien[t] >= 256) die("tie list");
+        tieu[t][tien[t]] = u; tieh[t][tien[t]] = h; tien[t]++;
+        for (int q = 0; q < Jn; q++) {
+            int g = LHcomp[(size_t)u * LHnS0 + LHmul[(size_t)h * LHnS0 + J[q]]];
+            if (gskip[g]) continue;
+            if (lh_check_g(g, t)) return 1;
+        }
+    }
+    if (LHr < 2 || t >= 32) { if (LHr >= 2 && t >= 32) die("lh2 level"); return 0; }
+    for (int tp = lv0 + 1; tp < t; tp++) for (int k = 0; k < tien[tp]; k++) {
+        int u = tieu[tp][k], h = tieh[tp][k];
+        for (int q = 0; q < Jn; q++) {
+            int g = LHcomp[(size_t)u * LHnS0 + LHmul[(size_t)h * LHnS0 + J[q]]];
+            if (gskip[g] || !((LHtrig[g] >> t) & 1)) continue;
+            if (lh_check_g(g, t)) return 1;
+        }
+    }
+    return 0;
+}
+static void search(int t);
+static void kids_loop(int t, const u64 *w, int nwords) {
+    u128 clearmask = ~(((((u128)1) << (vstart[t + 1] - vstart[t])) - 1) << vstart[t]);
+    if (probe_mode) {
+        long cnt = 0; for (int i = 0; i < nwords; i++) cnt += __builtin_popcountll(w[i]);
+        if (!cnt) return;
+        long pick = (long)(rnd64() % (unsigned long long)cnt);
+        for (int i = 0; i < nwords; i++) { long c = __builtin_popcountll(w[i]); if (pick < c) { u64 b = w[i]; for (long q = 0; q < pick; q++) b &= b - 1; long v = ((long)i << 6) + __builtin_ctzll(b);
+                    probe_w *= (double)cnt; est[t + 1] += probe_w;
+                    asg = (asg & clearmask) | (((u128)v) << vstart[t]); xv[t] = (u64)v; search(t + 1); asg &= clearmask; return; } pick -= c; }
+        return;
+    }
+    for (int i = 0; i < nwords; i++) {
+        u64 bits = w[i];
+        while (bits) {
+            int j = __builtin_ctzll(bits); bits &= bits - 1;
+            long v = ((long)i << 6) + j;
+            kids[t]++;
+            asg = (asg & clearmask) | (((u128)v) << vstart[t]); xv[t] = (u64)v;
+            search(t + 1); SETLEV(t);
+        }
+    }
+    asg &= clearmask;
+}
+static void search_fast(int t) {
+    LV *L = &LVL[t];
+    fastnodes++;
+    const uint16_t *S = L->vec ? s0vec(L, t) : NULL;
+    const int nr0 = L->nr0, ntr = L->ntr, nc = L->nc;
+    for (int i = 0; i < nr0; i++) { uint32_t s = lane_s0(L, S, i); if ((C[L->cid[i]].badbm[s >> 6] >> (s & 63)) & 1) { if (CHECK) check_node(L, t, S, NULL, 1); return; } }
+    if (L->nz == 1) {
+        __m512i al = _mm512_load_si512((const void *)L->allm);
+        for (int i = nr0; i < nr0 + ntr; i++) {
+            const FC *F = &L->fc[i];
+            uint32_t s = lane_s0(L, S, i);
+            uint32_t e = F->cvlo[s & 63] ^ F->cvhi[s >> 6];
+            __m512i B = _mm512_loadu_si512((const void *)(F->base + (e >> 16)));
+            B = _mm512_permutexvar_epi8(_mm512_xor_si512(IOTA, _mm512_set1_epi8((char)((e >> 3) & 63))), B);
+            B = _mm512_gf2p8affine_epi64_epi8(B, _mm512_set1_epi64((long long)AFF[e & 7]), 0);
+            al = _mm512_andnot_si512(B, al);
+            if (!_mm512_test_epi64_mask(al, al)) { if (CHECK) check_node(L, t, S, NULL, 1); return; }
+        }
+        u64 w[8] __attribute__((aligned(64)));
+        _mm512_store_si512((void *)w, al);
+        for (int i = nr0 + ntr; i < nc; i++) {           // rest: child by child
+            const Con *X = &C[L->cid[i]]; uint32_t s = lane_s0(L, S, i); int any = 0;
+            for (int k = 0; k < L->nwords; k++) { u64 b = w[k]; while (b) { int j = __builtin_ctzll(b); b &= b - 1; if (bad_child(X, s, (uint32_t)((k << 6) + j))) w[k] &= ~(1ULL << j); } any |= (w[k] != 0); }
+            if (!any) { if (CHECK) check_node(L, t, S, NULL, 1); return; }
+        }
+        if (CHECK) check_node(L, t, S, w, 0);
+        kids_loop(t, w, L->nwords);
+        return;
+    }
+    // multi-ZMM bitmaps (kt >= 10), list mode below L->thr survivors
+    const int nz = L->nz;
+    __m512i A[128];
+    for (int z = 0; z < nz; z++) A[z] = _mm512_load_si512((const void *)(L->allm + 8 * z));
+    int i = nr0;
+    uint32_t list[64]; int nlist = -1;
+    for (; i < nr0 + ntr; i++) {
+        const FC *F = &L->fc[i];
+        uint32_t s = lane_s0(L, S, i);
+        uint32_t e = F->cvlo[s & 63] ^ F->cvhi[s >> 6];
+        const uint8_t *bp = F->base + (e >> 16);
+        const __m512i idx = _mm512_xor_si512(IOTA, _mm512_set1_epi8((char)((e >> 3) & 63)));
+        const __m512i M = _mm512_set1_epi64((long long)AFF[e & 7]);
+        const int Z = (int)((e & 0xFFFF) >> 9);
+        __m512i any = _mm512_setzero_si512();
+        for (int z = 0; z < nz; z++) {
+            __m512i B = _mm512_loadu_si512((const void *)(bp + ((size_t)(z ^ Z) << 6)));
+            B = _mm512_gf2p8affine_epi64_epi8(_mm512_permutexvar_epi8(idx, B), M, 0);
+            A[z] = _mm512_andnot_si512(B, A[z]);
+            any = _mm512_or_si512(any, A[z]);
+        }
+        if (!_mm512_test_epi64_mask(any, any)) { if (CHECK) check_node(L, t, S, NULL, 1); return; }
+        if (L->thr > 0) {
+            long cnt = 0; for (int z = 0; z < nz; z++) cnt += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(A[z]));
+            if (cnt <= L->thr) {
+                u64 w[8] __attribute__((aligned(64))); nlist = 0;
+                for (int z = 0; z < nz; z++) { _mm512_store_si512((void *)w, A[z]); for (int k = 0; k < 8; k++) { u64 b = w[k]; while (b) { int j = __builtin_ctzll(b); b &= b - 1; list[nlist++] = (uint32_t)((z << 9) + (k << 6) + j); } } }
+                i++; break;
+            }
+        }
+    }
+    if (nlist >= 0) {
+        for (; i < nr0 + ntr; i++) {
+            const FC *F = &L->fc[i]; const u64 *bb = C[L->cid[i]].badbm;
+            uint32_t s = lane_s0(L, S, i); int nl = 0;
+            for (int q = 0; q < nlist; q++) {
+                uint32_t x = list[q]; uint32_t sv = s ^ F->vlo[x & 255] ^ F->vhi[x >> 8];
+                int bad = (int)((bb[sv >> 6] >> (sv & 63)) & 1);
+                list[nl] = x; nl += 1 - bad;
+            }
+            nlist = nl; if (!nlist) { if (CHECK) check_node(L, t, S, NULL, 1); return; }
+        }
+        for (; i < nc; i++) {
+            const Con *X = &C[L->cid[i]]; uint32_t s = lane_s0(L, S, i); int nl = 0;
+            for (int q = 0; q < nlist; q++) { uint32_t x = list[q]; int bad = bad_child(X, s, x); list[nl] = x; nl += 1 - bad; }
+            nlist = nl; if (!nlist) { if (CHECK) check_node(L, t, S, NULL, 1); return; }
+        }
+        u64 w[128 * 8] __attribute__((aligned(64)));
+        memset(w, 0, sizeof(u64) * L->nwords);
+        for (int q = 0; q < nlist; q++) w[list[q] >> 6] |= 1ULL << (list[q] & 63);   // list is in increasing order
+        if (CHECK) check_node(L, t, S, w, 0);
+        kids_loop(t, w, L->nwords);
+        return;
+    }
+    u64 w[128 * 8] __attribute__((aligned(64)));
+    for (int z = 0; z < nz; z++) _mm512_store_si512((void *)(w + 8 * z), A[z]);
+    for (; i < nc; i++) {
+        const Con *X = &C[L->cid[i]]; uint32_t s = lane_s0(L, S, i); int any = 0;
+        for (int k = 0; k < L->nwords; k++) { u64 b = w[k]; while (b) { int j = __builtin_ctzll(b); b &= b - 1; if (bad_child(X, s, (uint32_t)((k << 6) + j))) w[k] &= ~(1ULL << j); } any |= (w[k] != 0); }
+        if (!any) { if (CHECK) check_node(L, t, S, NULL, 1); return; }
+    }
+    if (CHECK) check_node(L, t, S, w, 0);
+    kids_loop(t, w, L->nwords);
+}
+static void search(int t) {
+    nid[t] = ++NIDC; SETLEV(t);
+    if (t == NLEV) {
+        if (SYM && sym_reject(t)) { symprune[t]++; return; }
+        if (LR && ltsr_reject(t)) { ltsprune[t]++; return; }
+        if (LH && (LH2 ? lh_reject2(t) : lh_reject(t))) { lhprune[t]++; return; }
+        nsol++;
+        printf("SOLUTION %016llx%016llx\n", (unsigned long long)(asg >> 64), (unsigned long long)asg); fflush(stdout);
+        return;
+    }
+    nodes[t]++;
+    if (stopflag) return;
+    if (SYM && sym_reject(t)) { symprune[t]++; return; }
+    if (LR && ltsr_reject(t)) { ltsprune[t]++; return; }
+    if (LH && lhact[t] && (LH2 ? lh_reject2(t) : lh_reject(t))) { lhprune[t]++; return; }
+    if (t == SPL) { long long id = splitcnt++; if (id % NPART != PART) return; }
+    if (LVL[t].on) { search_fast(t); return; }
+    int kt = vstart[t + 1] - vstart[t];
+    long nch = 1L << kt; int nw = (int)((nch + 63) / 64);
+    u64 *A = alive[t];
+    for (int i = 0; i < nw; i++) A[i] = ~0ULL;
+    if (nch % 64) A[nw - 1] = (1ULL << (nch % 64)) - 1;
+    int listmode = 0; int nlist = 0; uint32_t list[64];
+    for (int ci = lstart[t]; ci < lstart[t + 1]; ci++) {
+        Con *X = &C[ORD[ci]];
+        int s0 = syn0(X);
+        if (listmode) {
+            if (X->method == 2) { if ((X->badbm[s0 >> 6] >> (s0 & 63)) & 1) return; continue; }
+            int nl = 0;
+            if (X->V) {
+                const uint16_t *V = X->V; const u64 *bb = X->badbm;
+                for (int q = 0; q < nlist; q++) {      // branch-free compaction
+                    uint32_t x = list[q]; int sv = s0 ^ V[x];
+                    int bad = (int)((bb[sv >> 6] >> (sv & 63)) & 1);
+                    list[nl] = x; nl += 1 - bad;
+                }
+            } else
+            for (int q = 0; q < nlist; q++) {
+                uint32_t v = list[q]; int sv = s0;
+                while (v) { int j = __builtin_ctz(v); v &= v - 1; sv ^= X->col[j]; }
+                if (!((X->badbm[sv >> 6] >> (sv & 63)) & 1)) list[nl++] = list[q];
+            }
+            nlist = nl; if (!nlist) return;
+            continue;
+        }
+        if (X->method == 2) {            // fully determined by lower levels
+            if ((X->badbm[s0 >> 6] >> (s0 & 63)) & 1) return;
+            continue;
+        }
+        if (X->tb) {
+            // reduce s0 modulo Im L: s0 ^ L v0 = crep (coset rep), then bad children = base_crep translated by v0
+            uint32_t sv = (uint32_t)s0, v0 = 0;
+            for (int q = 0; q < X->irank; q++) { uint32_t mk = 0u - ((sv >> X->ipiv[q]) & 1u); sv ^= X->ivec[q] & mk; v0 ^= X->ipre[q] & mk; }
+            long ci2 = 0;
+            for (int q = 0; (1L << q) < X->ncos; q++) if ((sv >> X->cbits[q]) & 1) ci2 |= 1L << q;
+            u64 *tmp = tmpbuf;
+            const u64 *Bm = X->base + ci2 * nw;
+            if (nch < 64) { u64 w = Bm[0]; u64 o = w; uint32_t d = v0; o = w;
+                for (int j = 0; j < 6; j++) { int sh = 1 << j; u64 M = TMASK[j]; u64 mk = 0ULL - (u64)((d >> j) & 1); u64 sw = ((o & M) << sh) | ((o >> sh) & M); o = (o & ~mk) | (sw & mk); }
+                A[0] &= ~o; }
+            else { xor_translate(tmp, Bm, nw, v0); for (int i = 0; i < nw; i++) A[i] &= ~tmp[i]; }
+        } else if (X->method == 0) {
+            int s = s0;
+            for (long v = 0; v < nch; v++) {
+                if (v) { int j = __builtin_ctzl(v); s ^= X->col[j]; }
+                long g = v ^ (v >> 1);    // Gray code index whose syndrome is s
+                if ((X->badbm[s >> 6] >> (s & 63)) & 1) A[g >> 6] &= ~(1ULL << (g & 63));
+            }
+        } else {
+            for (int k = 0; k < X->nbad; k++) {
+                int r = X->bad[k] ^ s0; int ok = 1;
+                for (int z = 0; z < X->nz; z++) if (__builtin_popcount(X->Z[z] & r) & 1) { ok = 0; break; }
+                if (!ok) continue;
+                uint32_t v0 = 0;
+                for (int i = 0; i < X->rank; i++) if (__builtin_popcount(X->T[i] & r) & 1) v0 |= 1u << X->pivc[i];
+                uint32_t v = v0;
+                long nk = 1L << X->kdim;
+                for (long q = 0; q < nk; q++) {
+                    if (q) { int j = __builtin_ctzl(q); v ^= X->kb[j]; }
+                    A[v >> 6] &= ~(1ULL << (v & 63));
+                }
+            }
+        }
+        // early exit if nothing alive; switch to list mode when few children remain
+        long cnt = 0; for (int i = 0; i < nw; i++) cnt += __builtin_popcountll(A[i]);
+        if (!cnt) return;
+        if (cnt <= 48) {
+            listmode = 1; nlist = 0;
+            for (int i = 0; i < nw; i++) { u64 b = A[i]; while (b) { int j = __builtin_ctzll(b); b &= b - 1; list[nlist++] = (uint32_t)(((long)i << 6) + j); } }
+        }
+    }
+    if (listmode) {   // rebuild the alive bitmap from the list
+        for (int i = 0; i < nw; i++) A[i] = 0;
+        for (int q = 0; q < nlist; q++) A[list[q] >> 6] |= 1ULL << (list[q] & 63);
+    }
+    kids_loop(t, A, nw);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) die("usage: lwe INSTANCE [SPLITLEVEL NPART PART]");
+    read_inst(argv[1]);
+    make_order();
+    build_tables();
+    for (int l = 0; l < 42; l++) nid[l] = ++NIDC;
+    { const char *sf = getenv("SYMFILE"); if (sf) read_sym(sf); }
+    { const char *lf = getenv("LTSFILE"); if (lf) read_ltsr(lf); }
+    { const char *hf = getenv("LTSHFILE"); if (hf) read_ltsh(hf); }
+    CHECK = getenv("LWE11CHECK") != NULL;
+    if (!__builtin_cpu_supports("avx512vbmi") || !__builtin_cpu_supports("gfni") || !__builtin_cpu_supports("avx512bw") || !__builtin_cpu_supports("avx512vpopcntdq")) die("lwe11 needs AVX-512 VBMI, BW, VPOPCNTDQ and GFNI");
+    build_fast();
+    if (LH) build_lh2();
+    LH2 = getenv("LWE11OLDLH") == NULL;
+    if (argc > 4) { SPL = atoi(argv[2]); NPART = atoi(argv[3]); PART = atoi(argv[4]); }
+    int kmax = 0; for (int t = 0; t < NLEV; t++) { int k = vstart[t + 1] - vstart[t]; if (k > kmax) kmax = k; }
+    for (int t = 0; t < NLEV; t++) alive[t] = malloc(sizeof(u64) * (((1L << kmax) + 63) / 64 + 1));
+    tmpbuf = malloc(sizeof(u64) * (((1L << kmax) + 63) / 64 + 1));
+    time_t t0 = time(NULL); asg = 0;
+    { const char *pe = getenv("PROBES"); if (pe) PROBES = atol(pe); }
+    if (PROBES > 0) {
+        probe_mode = 1;
+        for (long p = 0; p < PROBES; p++) { probe_w = 1.0; est[0] += 1.0; asg = 0; search(0); }
+        double tot = 0; printf("PROBE estimate (%ld probes):", PROBES);
+        for (int t = 0; t <= NLEV; t++) { printf(" %d:%.3g", t, est[t] / PROBES); tot += est[t] / PROBES; }
+        printf("\nTOTAL nodes ~ %.3e\n", tot); return 0;
+    }
+    signal(SIGTERM, onsig); signal(SIGALRM, onsig); { const char *al = getenv("ALARM"); if (al) alarm(atoi(al)); }
+#ifdef PROFPC
+    if (getenv("PROFOUT")) prof_start();
+#endif
+    search(0);
+#ifdef PROFPC
+    if (getenv("PROFOUT")) prof_dump();
+#endif
+    if (stopflag) printf("STOPPED (partial counts)\n");
+    printf("DONE lwe nsol %lld time %lds split %d part %d/%d N %d\n", nsol, (long)(time(NULL) - t0), SPL, PART, NPART, N);
+    for (int t = 0; t < NLEV; t++) printf("LEVEL %d kt %d ncons %d nodes %lld kids %lld symprune %lld ltsprune %lld lhprune %lld\n", t, vstart[t + 1] - vstart[t], lstart[t + 1] - lstart[t], nodes[t], kids[t], symprune[t], ltsprune[t], lhprune[t]);
+    printf("SYMPRUNE at leaves %lld LTSPRUNE at leaves %lld LHPRUNE at leaves %lld\n", symprune[NLEV], ltsprune[NLEV], lhprune[NLEV]);
+    if (CHECK) fprintf(stderr, "LWE11CHECK passed: %lld fast nodes checked\n", checknodes);
+    return 0;
+}

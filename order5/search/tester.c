@@ -1,0 +1,256 @@
+// Generic case (A is an information set): C1 = {(a, aU)}, U unitary 7x7 over F16.
+// Search rows of U (rows indexed by A-coordinates in order ORD).
+// Symmetry used: D = mu5 row/column scalings (canonical form), GL(3,2)_B x Gal on row 0's class pattern,
+// and GL(3,2)_A transitivity: row ORD[0] has the minimal orbit key among all 7 rows.
+// Env: THRESH (default 16), PART=i, NPART=N (split depth-1 nodes), REP_ONLY=r.
+#include "common.h"
+#include <omp.h>
+
+static const int ORD[7] = {0,1,3,2,4,5,6};
+static int GL[168][7]; static int nGL=0;
+static int THRESH=16;
+static uint16_t KEY[1<<14];
+static uint32_t *CORD[8]; static long NCORD[8];
+static uint32_t *CHK[8]; static long NCHK[8];   // packed: combo index <<2 | class     // canonical (min-image) pattern index under GL(3,2) x swap(2<->3)
+
+static int check_row_single(uint32_t v){
+    if(hdot(v,v)!=1) return 0;
+    for(int c=1;c<4;c++){
+        uint32_t w=smul(REP[c],v);
+        if(Mtab[pidx(w)] + (c==1?4:2) < THRESH) return 0;
+    }
+    return 1;
+}
+static int PAIR_L[45], PAIR_C[45];
+static void init_pair_order(void){
+    int n=0;
+    for(int tgt=4; tgt<=8; tgt+=2)
+        for(int l=1;l<16;l++) for(int c=1;c<4;c++)
+            if(WT5[l]+(c==1?4:2)==tgt){ PAIR_L[n]=l; PAIR_C[n]=c; n++; }
+    if(n!=45){ fprintf(stderr,"pair order error\n"); exit(1); }
+}
+static inline int pairOK(uint32_t v, uint32_t u){
+    uint32_t uc[4]; uc[1]=smul(REP[1],u); uc[2]=smul(REP[2],u); uc[3]=smul(REP[3],u);
+    for(int k=0;k<45;k++){
+        int l=PAIR_L[k], c=PAIR_C[k];
+        uint32_t b = smul(l,v) ^ uc[c];
+        if(Mtab[pidx(b)] + WT5[l] + (c==1?4:2) < THRESH) return 0;
+    }
+    return 1;
+}
+static void gen_GL(void){
+    int p[7]={0,1,2,3,4,5,6};
+    int lineset[7]; for(int l=0;l<7;l++) lineset[l]=(1<<LINES[l][0])|(1<<LINES[l][1])|(1<<LINES[l][2]);
+    while(1){
+        int ok=1;
+        for(int l=0;l<7&&ok;l++){
+            int m=(1<<p[LINES[l][0]])|(1<<p[LINES[l][1]])|(1<<p[LINES[l][2]]);
+            int f=0; for(int t=0;t<7;t++) if(lineset[t]==m) f=1;
+            if(!f) ok=0;
+        }
+        if(ok){ memcpy(GL[nGL],p,sizeof p); nGL++; }
+        int i=5; while(i>=0 && p[i]>p[i+1]) i--; if(i<0) break;
+        int j=6; while(p[j]<p[i]) j--; int t=p[i];p[i]=p[j];p[j]=t;
+        for(int a=i+1,b=6;a<b;a++,b--){t=p[a];p[a]=p[b];p[b]=t;}
+    }
+}
+static void gen_keys(void){
+    for(uint32_t p=0;p<(1u<<14);p++){
+        uint32_t best=p;
+        for(int g=0; g<nGL; g++) for(int sw=0; sw<2; sw++){
+            uint32_t q=0;
+            for(int j=0;j<7;j++){ int c=(p>>(2*j))&3; if(sw && c>=2) c=5-c; q|=(uint32_t)c<<(2*GL[g][j]); }
+            if(q<best) best=q;
+        }
+        KEY[p]=(uint16_t)best;
+    }
+}
+typedef struct { uint8_t par[14]; } UF;
+static inline int uf_find(UF *u, int x){ while(u->par[x]!=x) x=u->par[x]; return x; }
+static inline int dnorm_ok(const UF *st, int depth, uint32_t row, UF *out){
+    UF u=*st;
+    for(int j=0;j<7;j++){
+        int e=nib(row,j); if(!e) continue;
+        int a=uf_find(&u,depth), b=uf_find(&u,7+j);
+        if(a!=b){ if(e!=REP[CLS[e]]) return 0; u.par[a]=b; }
+    }
+    *out=u; return 1;
+}
+// Accept row u at depth d (given combos of rows 0..d-1); returns 1 if all codewords pass.
+static void init_check_lists(void){
+    // For depth d (placing row for coordinate ORD[d]), combos i over rows 0..d-1 (digit k = lambda for row k,
+    // position ORD[k]); a = sum lambda_k e_ORD[k] + REP[c] e_ORD[d]. Keep pairs with >=2 nonzero digits
+    // (weight 0/1 combos are guaranteed by R-membership and pairOK) and M_A <= THRESH-4
+    // (M_B >= 2 always since partial rows are orthonormal hence independent), sorted by M_A ascending.
+    for(int d=1; d<=6; d++){
+        long n=1L<<(4*d);
+        long cap=0; long cnt[40]={0};
+        uint8_t *ma=malloc(n*4);
+        for(long i=0;i<n;i++){
+            int nz=0; uint32_t pa=0;
+            for(int k=0;k<d;k++){ int l=(i>>(4*k))&15; if(l){ nz++; pa|=(uint32_t)CLS[l]<<(2*ORD[k]); } }
+            for(int c=1;c<4;c++){
+                int m = Mtab[pa | ((uint32_t)c<<(2*ORD[d]))];
+                ma[i*4+c]= (nz>=2 && m<=THRESH-4) ? (uint8_t)m : 255;
+                if(ma[i*4+c]!=255){ cnt[m]++; cap++; }
+            }
+        }
+        CHK[d]=malloc((cap+1)*sizeof(uint32_t)); long q=0;
+        for(int m=0;m<40;m++) if(cnt[m]) for(long i=0;i<n;i++) for(int c=1;c<4;c++) if(ma[i*4+c]==m) CHK[d][q++]=(uint32_t)(i<<2|c);
+        NCHK[d]=q; free(ma);
+    }
+}
+static void init_combo_order(void){
+    for(int d=1; d<=6; d++){
+        long n=1L<<(4*d); CORD[d]=malloc(n*sizeof(uint32_t)); long q=0;
+        for(int w=2; w<=d; w++)
+            for(long i=0;i<n;i++){ int nz=0; for(int k=0;k<d;k++) if((i>>(4*k))&15) nz++; if(nz==w) CORD[d][q++]=(uint32_t)i; }
+        NCORD[d]=q;
+    }
+}
+static inline int full_check(uint32_t u, int depth, const uint32_t *cB, const uint16_t *cPA, long ncombo){
+    int sh=2*ORD[depth];
+    const uint32_t *chk=CHK[depth]; long nchk=NCHK[depth]; (void)ncombo;
+    uint32_t uc[4]; uc[0]=0; uc[1]=smul(REP[1],u); uc[2]=smul(REP[2],u); uc[3]=smul(REP[3],u);
+    for(long k=0;k<nchk;k++){
+        uint32_t e=chk[k]; long i=e>>2; int c=e&3;
+        if(Mtab[cPA[i] | ((uint32_t)c<<sh)] + Mtab[pidx(cB[i]^uc[c])] < THRESH) return 0;
+    }
+    return 1;
+}
+static void dfs(int depth, uint32_t *rows, const uint32_t *cB, const uint16_t *cPA, long ncombo,
+                const uint32_t *L, long nL, const UF *uf, long long *cnt, long long *sols);
+// Try row u at 'depth'; pool = candidate pool for this depth (used to build the next pool).
+static void step(int depth, uint32_t u, uint32_t *rows, const uint32_t *cB, const uint16_t *cPA, long ncombo,
+                 const uint32_t *pool, long npool, const UF *uf, long long *cnt, long long *sols){
+    UF nu;
+    if(!dnorm_ok(uf,depth,u,&nu)) return;
+    if(!full_check(u,depth,cB,cPA,ncombo)) return;
+    cnt[depth+1]++;
+    rows[depth]=u;
+    if(depth==6){
+        (*sols)++;
+        #pragma omp critical
+        { printf("SOLUTION:"); for(int r=0;r<7;r++) printf(" %07x",rows[r]); printf("\n"); fflush(stdout); }
+        return;
+    }
+    uint32_t *L2=malloc((npool+1)*sizeof(uint32_t)); long n2=0;
+    for(long s=0;s<npool;s++){ uint32_t v=pool[s]; if(hdot(v,u)==0 && pairOK(u,v)) L2[n2++]=v; }
+    if(n2>0){
+        long nc2=ncombo*16;
+        uint32_t *nB=malloc(nc2*sizeof(uint32_t)); uint16_t *nPA=malloc(nc2*sizeof(uint16_t));
+        int sh=2*ORD[depth]; long q=0;
+        for(int l=0;l<16;l++){
+            uint32_t lu=smul(l,u); uint16_t add=(uint16_t)(CLS[l]<<sh);
+            for(long i=0;i<ncombo;i++){ nB[q]=cB[i]^lu; nPA[q]=cPA[i]|add; q++; }
+        }
+        dfs(depth+1, rows, nB, nPA, nc2, L2, n2, &nu, cnt, sols);
+        free(nB); free(nPA);
+    }
+    free(L2);
+}
+static void dfs(int depth, uint32_t *rows, const uint32_t *cB, const uint16_t *cPA, long ncombo,
+                const uint32_t *L, long nL, const UF *uf, long long *cnt, long long *sols){
+    for(long t=0;t<nL;t++) step(depth, L[t], rows, cB, cPA, ncombo, L, nL, uf, cnt, sols);
+}
+
+// ---------------- tester: random dives with brute-force child counts ----------------
+static uint64_t rs=0x9E3779B97F4A7C15ULL;
+static inline uint64_t xr(void){ rs^=rs<<13; rs^=rs>>7; rs^=rs<<17; return rs; }
+static uint16_t KEY0;
+// Brute force: count v in F16^7 that are valid children at depth d of node rows[0..d-1] (depth order),
+// using ONLY: hdot, KEY, dnorm_ok, and direct M_A+M_B checks for ALL a with a_d != 0 (incl. weight 0/1).
+static long brute_children(int d, const uint32_t *rows, const UF *uf){
+    long cnt=0;
+    // precompute combos of previous rows: B-vector and A-packed vector (nibbles at ORD positions)
+    long nc=1L<<(4*d);
+    uint32_t *cb=malloc(nc*sizeof(uint32_t)); uint32_t *ca=malloc(nc*sizeof(uint32_t));
+    for(long i=0;i<nc;i++){
+        uint32_t b=0,a=0;
+        for(int k=0;k<d;k++){ int l=(i>>(4*k))&15; b^=smul(l,rows[k]); a|=(uint32_t)l<<(4*ORD[k]); }
+        cb[i]=b; ca[i]=a;
+    }
+    #pragma omp parallel for reduction(+:cnt) schedule(dynamic,4096)
+    for(long vv=1; vv<(1L<<28); vv++){
+        uint32_t v=(uint32_t)vv;
+        if(hdot(v,v)!=1) continue;
+        int ok=1; for(int k=0;k<d;k++) if(hdot(v,rows[k])){ ok=0; break; }
+        if(!ok) continue;
+        if(KEY[pidx(v)]<KEY0) continue;
+        UF nu; if(!dnorm_ok(uf,d,v,&nu)) continue;
+        for(long i=0;i<nc && ok;i++){
+            for(int l=1;l<16;l++){
+                uint32_t b=cb[i]^smul(l,v);
+                uint32_t a=ca[i]|((uint32_t)l<<(4*ORD[d]));
+                if(Mtab[pidx(a)]+Mtab[pidx(b)]<THRESH){ ok=0; break; }
+            }
+        }
+        if(ok) cnt++;
+    }
+    free(cb); free(ca);
+    return cnt;
+}
+// Search-side child list at depth d: pool -> dnorm_ok -> full_check (exactly as step() does)
+static long search_children(int d, const uint32_t *pool, long npool, const UF *uf,
+                            const uint32_t *cB, const uint16_t *cPA, long nc, uint32_t *out){
+    long n=0;
+    for(long t=0;t<npool;t++){ uint32_t u=pool[t]; UF nu;
+        if(!dnorm_ok(uf,d,u,&nu)) continue;
+        if(!full_check(u,d,cB,cPA,nc)) continue;
+        if(out) out[n]=u; n++; }
+    return n;
+}
+int main(int argc, char **argv){
+    THRESH = getenv("THRESH")?atoi(getenv("THRESH")):16;
+    int ndives = getenv("NDIVES")?atoi(getenv("NDIVES")):10;
+    if(getenv("SEED")) rs=strtoull(getenv("SEED"),0,10);
+    init_tables(); gen_GL(); gen_keys(); init_pair_order(); init_check_lists();
+    uint32_t *R=malloc((size_t)(1u<<26)*sizeof(uint32_t)); long nR=0;
+    for(uint32_t v=1; v<(1u<<28); v++) if(check_row_single(v)) R[nR++]=v;
+    int nreps=0; uint32_t reps[4096]; uint16_t repkey[4096];
+    for(uint32_t p=0;p<(1u<<14);p++){
+        if(KEY[p]!=p) continue;
+        uint32_t u=0; for(int j=0;j<7;j++){ int c=(p>>(2*j))&3; u|=(uint32_t)REP[c]<<(4*j); }
+        if(!check_row_single(u)) continue;
+        repkey[nreps]=(uint16_t)p; reps[nreps++]=u;
+    }
+    fprintf(stderr,"THRESH=%d |R|=%ld reps=%d\n",THRESH,nR,nreps);
+    long mism=0, compared=0;
+    for(int dv=0; dv<ndives; dv++){
+        int r=(int)(xr()%nreps); KEY0=repkey[r];
+        uint32_t rows[7]; rows[0]=reps[r];
+        UF uf; for(int i=0;i<14;i++) uf.par[i]=i; UF cur; dnorm_ok(&uf,0,rows[0],&cur);
+        // depth-1 pool exactly as main of gen4
+        uint32_t *pool=malloc(nR*sizeof(uint32_t)); long np=0;
+        for(long s2=0;s2<nR;s2++){ uint32_t v=R[s2];
+            if(KEY[pidx(v)]<repkey[r]) continue;
+            { int e=0; for(int j=0;j<7;j++){ e=nib(v,j); if(e) break; } if(e!=REP[CLS[e]]) continue; }
+            if(hdot(v,rows[0])==0 && pairOK(rows[0],v)) pool[np++]=v; }
+        uint32_t *cB=malloc(16*sizeof(uint32_t)); uint16_t *cPA=malloc(16*sizeof(uint16_t)); long nc=16;
+        for(int l=0;l<16;l++){ cB[l]=smul(l,rows[0]); cPA[l]=(uint16_t)(CLS[l]<<(2*ORD[0])); }
+        for(int d=1; d<7; d++){
+            uint32_t *kids=malloc((np+1)*sizeof(uint32_t));
+            long ns=search_children(d,pool,np,&cur,cB,cPA,nc,kids);
+            long nb=brute_children(d,rows,&cur);
+            compared++;
+            fprintf(stderr,"dive %d rep %d depth %d: search %ld brute %ld %s\n",dv,r,d,ns,nb,ns==nb?"OK":"MISMATCH");
+            if(ns!=nb) mism++;
+            if(ns==0){ free(kids); break; }
+            uint32_t u=kids[xr()%ns]; free(kids);
+            UF nu; dnorm_ok(&cur,d,u,&nu); cur=nu; rows[d]=u;
+            if(d==6) break;
+            // next pool and combos (as step())
+            uint32_t *p2=malloc((np+1)*sizeof(uint32_t)); long n2=0;
+            for(long s2=0;s2<np;s2++){ uint32_t v=pool[s2]; if(hdot(v,u)==0 && pairOK(u,v)) p2[n2++]=v; }
+            free(pool); pool=p2; np=n2;
+            long nc2=nc*16; uint32_t *nB=malloc(nc2*sizeof(uint32_t)); uint16_t *nP=malloc(nc2*sizeof(uint16_t));
+            int sh=2*ORD[d]; long q=0;
+            for(int l=0;l<16;l++){ uint32_t lu=smul(l,u); uint16_t add=(uint16_t)(CLS[l]<<sh);
+                for(long i=0;i<nc;i++){ nB[q]=cB[i]^lu; nP[q]=cPA[i]|add; q++; } }
+            free(cB); free(cPA); cB=nB; cPA=nP; nc=nc2;
+        }
+        free(pool); free(cB); free(cPA);
+    }
+    fprintf(stderr,"TESTER THRESH=%d: %ld comparisons, %ld mismatches\n",THRESH,compared,mism);
+    return mism?1:0;
+}

@@ -1,0 +1,147 @@
+# Plants for check_controls.sh: deliberately wrong cases that the checker must reject. Each entry is a header line
+# "== <module> <line>:<col> (what is wrong)" followed by the message the checker is told to expect.
+== C72T1Plants.P01PlantBuilds 10:2 (the module builds)
+Tactic `decide` proved that the proposition
+  (permute c3) (Pi.single 0 1) = Pi.single ((Equiv.symm c3) 0) 1
+is false
+== C72T1Plants.P02PlantWrongError 12:8 (another error than the expected one)
+Tactic `decide` proved that the proposition
+  (permute c3) (Pi.single 0 1) = Pi.single ((Equiv.symm c3) 0) 1
+is false
+== C72T1Plants.P03PlantTwoErrors 13:4 (two errors)
+Tactic `decide` proved that the proposition
+  (permute c3) (Pi.single 0 1) = Pi.single ((Equiv.symm c3) 0) 1
+is false
+== C72T1Plants.P04PlantErrorBeforeTheorem 12:2 (the error is in an earlier declaration)
+Tactic `decide` proved that the proposition
+  2 ≠ 2
+is false
+== C72T2Controls.P01PlantBuilds 10:2 (the module builds)
+Tactic `decide` proved that the proposition
+  ∀ (u v : F4), ∑ b, u.psi b * v.psi b = (u * v).tr
+is false
+== C72T2Controls.P02PlantWrongError 11:2 (another error than the expected one)
+Tactic `decide` proved that the proposition
+  ∀ (u v : F4), ∑ b, u.psi b * v.psi b = (u * v).tr
+is false
+== C72T2Controls.P03PlantTwoErrors 10:2 (two errors)
+Tactic `decide` proved that the proposition
+  ∀ (u v : F4), ∑ b, u.psi b * v.psi b = (u * v).tr
+is false
+== C72T2Controls.P04PlantErrorBeforeTheorem 14:2 (the error is in an earlier declaration)
+Tactic `decide` proved that the proposition
+  ∀ (u v : F4), ∑ b, u.psi b * v.psi b = (u * v).tr
+is false
+== C72T2Controls.C01TraceBilinear 13:2 (a control checked against a wrong position)
+Tactic `decide` proved that the proposition
+  ∀ (u v : F4), ∑ b, u.psi b * v.psi b = (u * v).tr
+is false
+== C72T3Controls.P01PlantBuilds 8:2 (the module builds)
+Tactic `decide` proved that the proposition
+  F16.t ^ 5 ≠ 1
+is false
+== C72T3Controls.P02PlantWrongError 9:17 (another error than the expected one)
+Tactic `decide` proved that the proposition
+  F16.t ^ 5 ≠ 1
+is false
+== C72T3Controls.P03PlantTwoErrors 8:2 (two errors)
+Tactic `decide` proved that the proposition
+  F16.t ^ 5 ≠ 1
+is false
+== C72T3Controls.P04PlantErrorBeforeTheorem 12:2 (the error is in an earlier declaration)
+Tactic `decide` proved that the proposition
+  F16.t ^ 5 ≠ 1
+is false
+== C72T3Controls.P05PlantWrongProposition 9:2 (the message is for another proposition)
+Tactic `decide` proved that the proposition
+  F16.t ^ 5 ≠ 1
+is false
+== C72T5Controls.P01PlantBuilds 8:0 (the module builds)
+Tactic `decide` proved that the proposition
+  go tets octs 8 8 0 0 0 = true
+is false
+== C72T5Controls.P02PlantWrongError 9:8 (another error than the expected one)
+Tactic `decide` proved that the proposition
+  go tets octs 8 8 0 0 0 = true
+is false
+== C72T5Controls.P03PlantTwoErrors 8:2 (two errors)
+Tactic `decide` proved that the proposition
+  go tets octs 8 8 0 0 0 = true
+is false
+== C72T5Controls.P04PlantErrorBeforeTheorem 11:0 (the error is in an earlier declaration)
+Tactic `decide` proved that the proposition
+  go tets octs 8 8 0 0 0 = true
+is false
+== C72T5Controls.P05PlantWrongProposition 9:2 (the message is for another proposition)
+Tactic `decide` proved that the proposition
+  go tets octs 8 8 0 0 0 = true
+is false
+== C72T6O3Controls.P01PlantBuilds 10:2 (the module builds)
+Tactic `decide` proved that the proposition
+  rho 7 < rho 12
+is false
+== C72T6O3Controls.P02PlantWrongError 11:2 (another error than the expected one)
+Tactic `decide` proved that the proposition
+  rho 7 < rho 12
+is false
+== C72T6O3Controls.P03PlantTwoErrors 10:2 (two errors)
+Tactic `decide` proved that the proposition
+  rho 7 < rho 12
+is false
+== C72T6O3Controls.P04PlantErrorBeforeTheorem 14:2 (the error is in an earlier declaration)
+Tactic `decide` proved that the proposition
+  rho 7 < rho 12
+is false
+== C72T6O3Controls.C03RhoViolatesN2 13:2 (a control checked against a wrong position)
+Tactic `decide` proved that the proposition
+  rho 7 < rho 12
+is false
+== C72T6O3Controls.C01ClosureWithoutQ1 16:2 (a control checked against a wrong message)
+Tactic `decide` proved that the proposition
+  closeIter 2 159 = FULL
+is false
+== C72T6O3Controls.C02SwapNotAut 14:2 (a control checked against a wrong message)
+(kernel) application type mismatch
+  id (Eq.refl true)
+argument has type
+  true = true
+but function has type
+  decide (autOK (Equiv.swap 0 1) = true) = true → decide (autOK (Equiv.swap 0 1) = true) = true
+== C72T6O5Controls.P01PlantBuilds 10:2 (the module builds)
+Tactic `decide` proved that the proposition
+  scanIdx 2 0 < scanIdx 3 0
+is false
+== C72T6O5Controls.P02PlantWrongError 11:2 (another error than the expected one)
+Tactic `decide` proved that the proposition
+  scanIdx 2 0 < scanIdx 3 0
+is false
+== C72T6O5Controls.P03PlantTwoErrors 10:2 (two errors)
+Tactic `decide` proved that the proposition
+  scanIdx 2 0 < scanIdx 3 0
+is false
+== C72T6O5Controls.P04PlantErrorBeforeTheorem 14:2 (the error is in an earlier declaration)
+Tactic `decide` proved that the proposition
+  scanIdx 2 0 < scanIdx 3 0
+is false
+== C72T6O5Controls.C04ScanOrder 12:2 (a control checked against a wrong position)
+Tactic `decide` proved that the proposition
+  scanIdx 2 0 < scanIdx 3 0
+is false
+== C72T6O5Controls.C01KeyNotPattern 15:2 (a control checked against a wrong message)
+Tactic `decide` proved that the proposition
+  key revRow = pattern revRow
+is false
+== C72T6O5Controls.C02ReflectionNotColl 14:2 (a control checked against a wrong message)
+(kernel) application type mismatch
+  id (Eq.refl true)
+argument has type
+  true = true
+but function has type
+  decide (linesOK ![0, 6, 5, 4, 3, 2, 1] = true) = true → decide (linesOK ![0, 6, 5, 4, 3, 2, 1] = true) = true
+== C72T6O5Controls.C05KeyUsesFrob 14:2 (a control checked against a wrong message)
+(kernel) application type mismatch
+  id (Eq.refl true)
+argument has type
+  true = true
+but function has type
+  decide (key frobRow = 2) = true → decide (key frobRow = 2) = true
